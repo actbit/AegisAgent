@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="AegisAgent.Core/AegisAgent.Core.csproj" />
+  <Project Path="AegisAgent/AegisAgent.csproj" />
+</Solution>
