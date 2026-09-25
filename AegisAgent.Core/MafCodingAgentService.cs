@@ -1,9 +1,13 @@
 using System.ClientModel;
 using System.Text;
+using System.Text.Json;
+using Anthropic;
+using Anthropic.Core;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using OpenAI;
 using OpenAI.Chat;
+using OpenAI.Responses;
 
 namespace AegisAgent.Core;
 
@@ -13,6 +17,9 @@ namespace AegisAgent.Core;
 /// </summary>
 public sealed class MafCodingAgentService
 {
+    private static readonly JsonSerializerOptions SessionSerializerOptions =
+        AgentAbstractionsJsonUtilities.DefaultOptions;
+
     private MafCodingAgentService(
         AgentSettings settings,
         CodingWorkspace workspace,
@@ -37,8 +44,31 @@ public sealed class MafCodingAgentService
 
     public static MafCodingAgentService Create(AgentSettings settings, CodingWorkspace workspace)
     {
-        ChatClient openAiClient = CreateChatClient(settings);
-        IChatClient chatClient = openAiClient.AsIChatClient();
+        IChatClient chatClient = CreateChatClient(settings);
+        return CreateCore(settings, workspace, chatClient);
+    }
+
+    public static async Task<MafCodingAgentService> CreateAsync(
+        AgentSettings settings,
+        CodingWorkspace workspace,
+        ChatGptOAuthCredentialStore oauth,
+        CancellationToken cancellationToken = default)
+    {
+        if (!settings.BackendKind.Equals("maf-chatgpt-oauth", StringComparison.OrdinalIgnoreCase))
+        {
+            return Create(settings, workspace);
+        }
+
+        ResponsesClient responsesClient = await oauth.CreateResponsesClientAsync(settings.Model, cancellationToken);
+        IChatClient chatClient = responsesClient.AsIChatClient(settings.Model);
+        return CreateCore(settings, workspace, chatClient);
+    }
+
+    private static MafCodingAgentService CreateCore(
+        AgentSettings settings,
+        CodingWorkspace workspace,
+        IChatClient chatClient)
+    {
         AITool[] tools = workspace.CreateTools();
         HarnessAgentOptions harnessOptions = new()
         {
@@ -51,7 +81,11 @@ public sealed class MafCodingAgentService
             {
                 Instructions = AgentInstructions(workspace.RootPath),
                 Tools = tools,
-                MaxOutputTokens = settings.MaxOutputTokens,
+                // The ChatGPT Codex endpoint rejects max_output_tokens. OpenCode
+                // omits it for this backend as well.
+                MaxOutputTokens = settings.BackendKind.Equals("maf-chatgpt-oauth", StringComparison.OrdinalIgnoreCase)
+                    ? null
+                    : settings.MaxOutputTokens,
             },
         };
 
@@ -69,7 +103,37 @@ public sealed class MafCodingAgentService
         Session = await Agent.CreateSessionAsync(cancellationToken);
     }
 
-    public async Task<string> RunAsync(string prompt, CancellationToken cancellationToken = default)
+    public async Task<JsonElement?> SerializeSessionAsync(CancellationToken cancellationToken = default)
+    {
+        if (Session is null)
+        {
+            return null;
+        }
+
+        return await Agent.SerializeSessionAsync(Session, SessionSerializerOptions, cancellationToken);
+    }
+
+    public async Task RestoreSessionAsync(
+        JsonElement snapshot,
+        CancellationToken cancellationToken = default)
+    {
+        Session = await Agent.DeserializeSessionAsync(snapshot, SessionSerializerOptions, cancellationToken);
+    }
+
+    public void RestoreTextHistory(IEnumerable<Microsoft.Extensions.AI.ChatMessage> messages)
+    {
+        if (Session is null)
+        {
+            return;
+        }
+
+        Session.SetInMemoryChatHistory(messages.ToList());
+    }
+
+    public async Task<string> RunAsync(
+        string prompt,
+        Func<AgentResponseUpdate, Task>? updateHandler = null,
+        CancellationToken cancellationToken = default)
     {
         if (Session is null)
         {
@@ -77,19 +141,62 @@ public sealed class MafCodingAgentService
         }
 
         StringBuilder output = new();
-        await foreach (AgentResponseUpdate update in Agent.RunStreamingAsync(prompt, Session!))
+        try
         {
-            output.Append(update.ToString());
+            await foreach (AgentResponseUpdate update in Agent.RunStreamingAsync(prompt, Session!))
+            {
+                if (updateHandler is not null)
+                {
+                    await updateHandler(update);
+                }
+
+                output.Append(update.Text);
+            }
+        }
+        catch (ClientResultException exception)
+        {
+            throw new InvalidOperationException(FormatServiceError(exception), exception);
         }
 
         return output.ToString().Trim();
     }
 
-    private static ChatClient CreateChatClient(AgentSettings settings)
+    private static string FormatServiceError(ClientResultException exception)
     {
+        try
+        {
+            string detail = exception.GetRawResponse()?.Content.ToString() ?? string.Empty;
+            return string.IsNullOrWhiteSpace(detail)
+                ? exception.Message
+                : $"{exception.Message}\n{detail}";
+        }
+        catch (InvalidOperationException)
+        {
+            return exception.Message;
+        }
+    }
+
+    private static IChatClient CreateChatClient(AgentSettings settings)
+    {
+        if (settings.BackendKind.Equals("maf-anthropic", StringComparison.OrdinalIgnoreCase))
+        {
+            ClientOptions anthropicOptions = new()
+            {
+                ApiKey = settings.ApiKey,
+            };
+            if (!string.IsNullOrWhiteSpace(settings.BaseUrl))
+            {
+                anthropicOptions.BaseUrl = settings.BaseUrl;
+            }
+
+            return new AnthropicClient(anthropicOptions).AsIChatClient(settings.Model, settings.MaxOutputTokens);
+        }
+
+        string apiKey = string.IsNullOrWhiteSpace(settings.ApiKey) ? "local" : settings.ApiKey;
+
         if (string.IsNullOrWhiteSpace(settings.BaseUrl))
         {
-            return new ChatClient(settings.Model, settings.ApiKey);
+            return new ChatClient(settings.Model, apiKey).AsIChatClient();
         }
 
         OpenAIClientOptions clientOptions = new()
@@ -99,8 +206,8 @@ public sealed class MafCodingAgentService
 
         return new ChatClient(
             model: settings.Model,
-            credential: new ApiKeyCredential(settings.ApiKey),
-            options: clientOptions);
+            credential: new ApiKeyCredential(apiKey),
+            options: clientOptions).AsIChatClient();
     }
 
     private static string AgentInstructions(string workspaceRoot) => $"""

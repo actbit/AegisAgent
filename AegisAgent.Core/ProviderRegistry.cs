@@ -95,6 +95,19 @@ public sealed class ProviderRegistry
         return true;
     }
 
+    public bool SetModel(string name, string model)
+    {
+        int index = profiles.FindIndex(profile => profile.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+        if (index < 0 || string.IsNullOrWhiteSpace(model))
+        {
+            return false;
+        }
+
+        profiles[index] = profiles[index] with { Model = model.Trim() };
+        Save();
+        return true;
+    }
+
     public bool Remove(string name)
     {
         int removed = profiles.RemoveAll(profile => profile.Name.Equals(name, StringComparison.OrdinalIgnoreCase));

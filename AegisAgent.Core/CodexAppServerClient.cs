@@ -1,13 +1,14 @@
 using System.Diagnostics;
+using System.ComponentModel;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace AegisAgent.Core;
 
 /// <summary>
-/// Small JSONL client for the official Codex app-server.
-/// It is used only for the ChatGPT subscription provider because the managed
-/// ChatGPT OAuth credential is owned by Codex app-server, not the OpenAI API SDK.
+/// Legacy JSONL client for the official Codex app-server.
+/// The default Aegis OAuth path no longer needs this process; it remains as a
+/// compatibility building block for callers that explicitly choose app-server.
 /// </summary>
 public sealed class CodexAppServerClient : IAsyncDisposable
 {
@@ -38,7 +39,7 @@ public sealed class CodexAppServerClient : IAsyncDisposable
         }
 
         string command = Environment.GetEnvironmentVariable("AEGIS_CODEX_COMMAND")
-            ?? (OperatingSystem.IsWindows() ? "codex.cmd" : "codex");
+            ?? "codex";
         ProcessStartInfo startInfo = new()
         {
             FileName = command,
@@ -52,9 +53,18 @@ public sealed class CodexAppServerClient : IAsyncDisposable
         startInfo.ArgumentList.Add("app-server");
 
         process = new Process { StartInfo = startInfo };
-        if (!process.Start())
+        try
         {
-            throw new InvalidOperationException("Unable to start the Codex app-server process.");
+            if (!process.Start())
+            {
+                throw new InvalidOperationException("Codex app-server プロセスを起動できませんでした。");
+            }
+        }
+        catch (Win32Exception exception)
+        {
+            throw new InvalidOperationException(
+                $"Codex CLI が見つかりません。PATH に codex.exe を追加するか、AEGIS_CODEX_COMMAND に実行ファイルの絶対パスを設定してください。({command})",
+                exception);
         }
 
         input = process.StandardInput;

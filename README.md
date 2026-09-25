@@ -1,6 +1,6 @@
 # AegisAgent
 
-Microsoft Agent Framework の `HarnessAgent` を使った、DeepSeek Agent 風のローカル Coding Agent です。Spectre.Console ベースのリッチな TUI から、リポジトリの調査、計画、編集、検証までをマルチターンで実行します。
+Microsoft Agent Framework の `HarnessAgent` を使った、ローカル実行にも対応する Coding Agent です。Spectre.Console ベースのリッチな TUI から、リポジトリの調査、計画、編集、検証までをマルチターンで実行します。
 
 ## 構成
 
@@ -15,12 +15,14 @@ AegisAgent.Core/     MAF実行、workspaceツール、プロバイダー、OAuth
 
 - Microsoft Agent Framework Harness の plan / todo / mode / session
 - Spectre.Console のダッシュボード、履歴、パネル、確認プロンプト
+- 実行中の Tool Call / Tool Result のリアルタイム表示、クリックによる個別の展開・折りたたみ、`/tools` 一覧
 - workspace 内に限定したファイル一覧、読み込み、検索、編集、git status、コマンド実行
 - 編集とコマンド実行の承認ゲート（`--auto-approve` で省略可能）
 - TUI からのプロバイダー登録・切替・削除
-- OpenAI API、DeepSeek、その他の OpenAI 互換 API
+- OpenAI API、DeepSeek、Anthropic Claude、OpenRouter
+- Ollama、llama.cpp、vLLM、LM Studio などのローカル/OpenAI 互換推論サーバー
 - Windows DPAPI によるプロバイダー API キーのユーザー単位暗号化保存
-- ChatGPT サブスクリプション向けの OpenAI OAuth（公式 Codex app-server 経由）
+- ChatGPT サブスクリプション向けの OpenAI OAuth（OpenCode 互換の PKCE 経由。Codex CLI 不要）
 
 ## 起動
 
@@ -53,12 +55,12 @@ dotnet run --project .\AegisAgent -- --workspace .
 /provider add
 ```
 
-ウィザードで OpenAI API、DeepSeek、OpenAI-compatible、ChatGPT OAuth を選べます。API キーは次のどちらかで保存できます。
+ウィザードで OpenAI API、DeepSeek、Anthropic Claude、Ollama、llama.cpp、vLLM、LM Studio、OpenRouter、OpenAI-compatible、ChatGPT OAuth を選べます。ローカルプロバイダーは API キーなしで登録できます。API キーが必要なプロバイダーは次のどちらかで保存できます。
 
 - 環境変数名を登録する（推奨。実際のキーは環境変数から読む）
 - Windows ではキーを現在のユーザーの DPAPI で暗号化保存する
 
-登録済みプロファイルは `%LOCALAPPDATA%\AegisAgent\providers.json` に保存されます。OAuth プロファイルは秘密トークンをこのファイルには保存せず、Codex app-server が管理します。
+登録済みプロファイルは `%LOCALAPPDATA%\AegisAgent\providers.json` に保存されます。OAuth の refresh token はプロバイダー一覧とは分離し、Windows DPAPI で現在のユーザーに紐づけて保存します。
 
 ## ChatGPT サブスクリプション OAuth
 
@@ -68,28 +70,45 @@ ChatGPT のサブスクリプションを使う場合は、TUI で次を実行�
 /auth openai
 ```
 
-この機能は通常の OpenAI API キー方式ではなく、公式 Codex app-server の managed ChatGPT login を使用します。ブラウザーが開くので、ChatGPT にログインして認証を完了してください。成功後は `openai-chatgpt` プロファイルが有効になり、次回起動時から Codex app-server backend が選ばれます。
+この機能は通常の OpenAI API キー方式とは別に、OpenCode が採用している ChatGPT OAuth の PKCE ブラウザフローを使います。ブラウザーが開くので、ChatGPT にログインして認証を完了してください。成功後は `openai-chatgpt` プロファイルが有効になり、次回起動から Codex CLI / app-server なしで ChatGPT Codex endpoint に接続します。
 
-事前に Codex CLI をインストールし、`codex` または `codex.cmd` が PATH にある必要があります。別の実行ファイルを使う場合は `AEGIS_CODEX_COMMAND` で指定できます。
-
-OAuth backend は Microsoft Agent Framework の API-key `IChatClient` とは別経路です。MAF Harness のツール実行体験は維持しつつ、ChatGPT アカウント認証、承認、ストリーミングは公式 app-server に委譲します。
+OAuth の認証情報は `http://localhost:1455/auth/callback` で受け取り、access token の期限が近づくと refresh token で更新します。Microsoft Agent Framework の Harness と `ResponsesClient` を組み合わせるため、API キー方式と同じ workspace tools、承認ゲート、セッションを利用できます。
 
 ## TUI コマンド
 
 ```text
 /help                 コマンド一覧
+/toolcalls            Tool Call 表示状態
+/toolcalls collapse   Tool Call / Result を折りたたむ
+/toolcalls expand     Tool Call / Result を詳細表示
+/tools                利用可能な Tool と説明
 /provider list        登録済みプロバイダー一覧
 /provider add         プロバイダー登録ウィザード
 /provider use <name>  次回起動のプロバイダー切替
 /provider remove <name>
 /auth openai          ChatGPT OAuth ログイン
+/model list           モデル候補一覧
+/model use <model>    モデル切替（/model <model> も可）
+/history              現在の履歴を表示
+/history list         同じ workspace の履歴一覧
+/history new          新しい履歴を開始
+/history use           一覧から履歴を選択
+/history use <id>      ID で履歴を切り替え
+/history delete <id>  履歴を削除
+/history clear        現在の workspace/provider の履歴を全削除
 /status               git status
 /workspace            作業ルート
 /clear                会話セッションをクリア
 /exit                 終了
 ```
 
+詳細表示中の Tool Call / Tool Result パネルをクリックすると、その Tool Call だけ展開・折りたたみを切り替えられます。端末がマウスイベントに対応していない場合は `/toolcalls collapse` または `/toolcalls expand` を使ってください。
+
 上記以外の入力は Coding Agent への依頼として処理されます。エージェントは必要に応じて計画、todo、ファイル調査、編集、検証を行います。
+
+入力欄で `/` を押すと入力欄の下にコマンド候補が表示されます。矢印キーで候補を選び、Tab で補完できます。`/model list` は OpenAI 互換 endpoint または Anthropic endpoint からモデル一覧を取得し、`/model use ` の候補にも反映します。候補にないモデル ID もそのまま指定できます。
+
+会話履歴は `%LOCALAPPDATA%\AegisAgent\history.jsonl` に保存され、workspace・provider・conversation session ごとに分離されます。同じフォルダでも `/history new` で複数の履歴を持てます。Agent のセッション状態も `history-sessions.json` に保存され、再起動後に直近の履歴を再開します。
 
 ## CLI オプション
 
@@ -107,11 +126,13 @@ OAuth backend は Microsoft Agent Framework の API-key `IChatClient` とは別�
 | --- | --- | --- |
 | `OPENAI_API_KEY` | なし | OpenAI または OpenAI 互換 API のキー |
 | `DEEPSEEK_API_KEY` | なし | DeepSeek のキー |
+| `ANTHROPIC_API_KEY` | なし | Anthropic Claude のキー |
+| `OPENROUTER_API_KEY` | なし | OpenRouter のキー |
 | `OPENAI_BASE_URL` | OpenAI | OpenAI 互換 endpoint |
 | `OPENAI_MODEL` | `gpt-4.1-mini` | モデル名 |
 | `AEGIS_MAX_TOOL_ITERATIONS` | `20` | 1 依頼あたりのツール反復回数 |
 | `AEGIS_MAX_OUTPUT_TOKENS` | `8192` | 1 応答の最大出力トークン |
-| `AEGIS_CODEX_COMMAND` | `codex` / `codex.cmd` | OAuth 用 app-server 実行ファイル |
+| `AEGIS_CODEX_COMMAND` | `codex` | 互換用 app-server backend を明示的に使う場合の実行ファイル |
 
 ## 開発者向け
 

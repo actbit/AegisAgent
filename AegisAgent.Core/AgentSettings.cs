@@ -11,7 +11,7 @@ public sealed record AgentSettings(
 {
     public static AgentSettings Load(string? modelOverride, string? baseUrlOverride, ProviderProfile? profile = null)
     {
-        if (profile?.Kind.Equals("openai-chatgpt-oauth", StringComparison.OrdinalIgnoreCase) == true)
+        if (profile?.Kind.Equals(ProviderKinds.ChatGptOAuth, StringComparison.OrdinalIgnoreCase) == true)
         {
             return new AgentSettings(
                 string.Empty,
@@ -20,12 +20,27 @@ public sealed record AgentSettings(
                 ParsePositiveInt("AEGIS_MAX_TOOL_ITERATIONS", 20),
                 ParsePositiveInt("AEGIS_MAX_OUTPUT_TOKENS", 8_192),
                 profile.Name,
-                "codex-app-server");
+                "maf-chatgpt-oauth");
         }
 
-        string? apiKey = profile?.GetApiKey() ?? FirstEnvironment("OPENAI_API_KEY", "DEEPSEEK_API_KEY", "AZURE_OPENAI_API_KEY");
+        if (profile is not null && ProviderKinds.IsLocal(profile.Kind))
+        {
+            return new AgentSettings(
+                profile.GetApiKey() ?? "local",
+                modelOverride ?? profile.Model,
+                NormalizeBaseUrl(baseUrlOverride ?? profile.BaseUrl ?? ProviderKinds.DefaultBaseUrl(profile.Kind)),
+                ParsePositiveInt("AEGIS_MAX_TOOL_ITERATIONS", 20),
+                ParsePositiveInt("AEGIS_MAX_OUTPUT_TOKENS", 8_192),
+                profile.Name,
+                "maf-local");
+        }
+
+        string? apiKey = profile?.GetApiKey() ?? FirstEnvironment(EnvironmentKeyNames(profile?.Kind));
         string model = modelOverride ?? profile?.Model ?? Environment.GetEnvironmentVariable("OPENAI_MODEL") ?? "gpt-4.1-mini";
-        string? baseUrl = baseUrlOverride ?? profile?.BaseUrl ?? Environment.GetEnvironmentVariable("OPENAI_BASE_URL");
+        string? baseUrl = baseUrlOverride ?? profile?.BaseUrl ??
+            (profile is null
+                ? Environment.GetEnvironmentVariable("OPENAI_BASE_URL")
+                : ProviderKinds.DefaultBaseUrl(profile.Kind));
 
         return new AgentSettings(
             apiKey ?? string.Empty,
@@ -34,7 +49,9 @@ public sealed record AgentSettings(
             ParsePositiveInt("AEGIS_MAX_TOOL_ITERATIONS", 20),
             ParsePositiveInt("AEGIS_MAX_OUTPUT_TOKENS", 8_192),
             profile?.Name ?? "environment",
-            "maf");
+            profile?.Kind.Equals(ProviderKinds.Anthropic, StringComparison.OrdinalIgnoreCase) == true
+                ? "maf-anthropic"
+                : "maf");
     }
 
     private static string? FirstEnvironment(params string[] names)
@@ -50,6 +67,14 @@ public sealed record AgentSettings(
 
         return null;
     }
+
+    private static string[] EnvironmentKeyNames(string? kind) => kind?.ToLowerInvariant() switch
+    {
+        ProviderKinds.Anthropic => ["ANTHROPIC_API_KEY"],
+        ProviderKinds.OpenRouter => ["OPENROUTER_API_KEY", "OPENAI_API_KEY"],
+        ProviderKinds.DeepSeek => ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"],
+        _ => ["OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"],
+    };
 
     private static string? NormalizeBaseUrl(string? baseUrl)
     {

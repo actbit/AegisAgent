@@ -1,7 +1,9 @@
+using System.Text;
 using AegisAgent;
 using AegisAgent.Core;
 using Spectre.Console;
 
+ConfigureConsoleEncoding();
 DotEnv.Load(Directory.GetCurrentDirectory());
 
 if (CliOptions.IsHelpRequested(args))
@@ -35,38 +37,50 @@ if (!Directory.Exists(workspaceRoot))
 }
 
 CodingWorkspace workspace = new(workspaceRoot, options.AutoApprove);
+ChatGptOAuthCredentialStore oauth = new();
 
-if (settings.BackendKind.Equals("codex-app-server", StringComparison.OrdinalIgnoreCase))
+if (settings.BackendKind.Equals("maf-chatgpt-oauth", StringComparison.OrdinalIgnoreCase))
 {
-    await using CodexAppServerClient codex = new(workspaceRoot, settings.Model, AskCodexApprovalAsync);
+    MafCodingAgentService? oauthService = null;
     try
     {
-        await codex.StartAsync();
-        await new AegisTui(settings, providerRegistry, workspace, null, codex).RunAsync();
+        if (oauth.HasStoredCredential)
+        {
+            oauthService = await MafCodingAgentService.CreateAsync(settings, workspace, oauth);
+            await oauthService.InitializeAsync();
+        }
     }
     catch (Exception exception)
     {
-        AnsiConsole.MarkupLine($"[red]{Markup.Escape(exception.Message)}[/]");
-        Environment.ExitCode = 2;
+        AnsiConsole.MarkupLine($"[yellow]保存済み ChatGPT OAuth を読み込めませんでした: {Markup.Escape(exception.Message)}[/]");
     }
 
+    await new AegisTui(settings, providerRegistry, workspace, oauthService, oauth).RunAsync();
     return;
 }
 
-if (string.IsNullOrWhiteSpace(settings.ApiKey))
+if (string.IsNullOrWhiteSpace(settings.ApiKey) &&
+    !settings.BackendKind.Equals("maf-local", StringComparison.OrdinalIgnoreCase))
 {
     AnsiConsole.MarkupLine("[yellow]API キーが未設定です。まず TUI で /provider add または /auth openai を実行してください。[/]");
-    await new AegisTui(settings, providerRegistry, workspace, null, null).RunAsync();
+    await new AegisTui(settings, providerRegistry, workspace, null, oauth).RunAsync();
     return;
 }
 
 MafCodingAgentService mafService = MafCodingAgentService.Create(settings, workspace);
 await mafService.InitializeAsync();
-await new AegisTui(settings, providerRegistry, workspace, mafService, null).RunAsync();
+await new AegisTui(settings, providerRegistry, workspace, mafService, oauth).RunAsync();
 
-static async Task<string> AskCodexApprovalAsync(string action)
+static void ConfigureConsoleEncoding()
 {
-    bool accepted = AnsiConsole.Confirm($"[yellow]許可しますか？[/] {Markup.Escape(action)}", false);
-    await Task.CompletedTask;
-    return accepted ? "accept" : "decline";
+    try
+    {
+        UTF8Encoding utf8 = new(encoderShouldEmitUTF8Identifier: false);
+        Console.InputEncoding = utf8;
+        Console.OutputEncoding = utf8;
+    }
+    catch (IOException)
+    {
+        // Some redirected or legacy hosts do not allow changing the console code page.
+    }
 }

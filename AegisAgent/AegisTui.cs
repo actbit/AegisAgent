@@ -1,94 +1,126 @@
 using System.Text;
+using System.Text.Json;
 using AegisAgent.Core;
+using Microsoft.Agents.AI;
+using Microsoft.Extensions.AI;
 using Spectre.Console;
 
 namespace AegisAgent;
 
 internal sealed class AegisTui
 {
-    private readonly AgentSettings settings;
+    private AgentSettings settings;
     private readonly ProviderRegistry providerRegistry;
     private readonly CodingWorkspace workspace;
-    private readonly MafCodingAgentService? mafService;
-    private readonly CodexAppServerClient? codex;
+    private MafCodingAgentService? mafService;
+    private readonly ChatGptOAuthCredentialStore? oauth;
+    private readonly ConversationHistoryStore historyStore;
     private readonly List<ChatEntry> history = [];
+    private readonly Dictionary<string, ToolCallView> activeToolCalls = new(StringComparer.Ordinal);
+    private readonly List<ToolCallView> toolCallViews = [];
+    private IReadOnlyList<string> discoveredModels = [];
+    private string sessionId;
     private int turnNumber;
+    private bool toolCallsCollapsed;
+    private string? lastAnswer;
 
     public AegisTui(
         AgentSettings settings,
         ProviderRegistry providerRegistry,
         CodingWorkspace workspace,
         MafCodingAgentService? mafService,
-        CodexAppServerClient? codex)
+        ChatGptOAuthCredentialStore? oauth)
     {
         this.settings = settings;
         this.providerRegistry = providerRegistry;
         this.workspace = workspace;
         this.mafService = mafService;
-        this.codex = codex;
+        this.oauth = oauth;
+        historyStore = new ConversationHistoryStore();
+        sessionId = historyStore.GetLatestSessionId(workspace.RootPath, settings.ProviderName)
+            ?? Guid.NewGuid().ToString("N");
+        LoadCurrentHistory();
     }
 
     public async Task RunAsync()
     {
-        Console.OutputEncoding = Encoding.UTF8;
-        TryClear();
-        RenderWelcome();
-
-        while (true)
+        try
         {
-            RenderDashboard();
-            string input;
-            try
-            {
-                input = ReadInput();
-            }
-            catch (OperationCanceledException)
-            {
-                break;
-            }
-
-            if (string.IsNullOrWhiteSpace(input))
-            {
-                continue;
-            }
-
-            if (input.Equals("/exit", StringComparison.OrdinalIgnoreCase) || input.Equals("/quit", StringComparison.OrdinalIgnoreCase))
-            {
-                break;
-            }
-
-            if (await HandleCommandAsync(input.Trim()))
-            {
-                continue;
-            }
-
-            await RunTurnAsync(input.Trim());
+            Console.InputEncoding = Encoding.UTF8;
+            Console.OutputEncoding = Encoding.UTF8;
+        }
+        catch (IOException)
+        {
+            // Some redirected or legacy hosts do not allow changing the console code page.
         }
 
-        AnsiConsole.MarkupLine("[grey]Aegis を終了しました。[/]");
+        bool mouseReportingEnabled = EnableMouseReporting();
+        try
+        {
+            TryClear();
+            RenderWelcome();
+            await RestoreSelectedAgentSessionAsync();
+
+            while (true)
+            {
+                RenderDashboard();
+                string input;
+                try
+                {
+                    input = ReadInput();
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+
+                if (string.IsNullOrWhiteSpace(input))
+                {
+                    continue;
+                }
+
+                if (input.Equals("/exit", StringComparison.OrdinalIgnoreCase) || input.Equals("/quit", StringComparison.OrdinalIgnoreCase))
+                {
+                    break;
+                }
+
+                if (await HandleCommandAsync(input.Trim()))
+                {
+                    continue;
+                }
+
+                await RunTurnAsync(input.Trim());
+            }
+
+            AnsiConsole.MarkupLine("[grey]Aegis を終了しました。[/]");
+        }
+        finally
+        {
+            if (mouseReportingEnabled)
+            {
+                DisableMouseReporting();
+            }
+        }
     }
 
     private async Task RunTurnAsync(string input)
     {
         turnNumber++;
         history.Add(new ChatEntry("user", input));
-        AnsiConsole.MarkupLine($"[grey]Turn {turnNumber}: agent is working...[/]");
+        historyStore.Append(workspace.RootPath, settings.ProviderName, settings.Model, sessionId, "user", input);
+        activeToolCalls.Clear();
+        toolCallViews.Clear();
+        lastAnswer = null;
+        AnsiConsole.Write(new Rule($"[deepskyblue1]Turn {turnNumber}[/]").LeftJustified());
+        AnsiConsole.MarkupLine("[grey]依頼を処理中です。Tool Call は下に表示されます。[/]");
 
         try
         {
             string answer;
-            if (codex is not null)
+            MafCodingAgentService? service = mafService;
+            if (service is not null)
             {
-                string progress = "starting";
-                answer = await codex.RunTurnAsync(input, value => progress = value);
-                if (!string.IsNullOrWhiteSpace(progress))
-                {
-                    AnsiConsole.MarkupLine($"[grey]Codex app-server: {Markup.Escape(progress)}[/]");
-                }
-            }
-            else if (mafService is not null)
-            {
-                answer = await mafService.RunAsync(input);
+                answer = await service.RunAsync(input, HandleAgentUpdateAsync);
             }
             else
             {
@@ -97,11 +129,277 @@ internal sealed class AegisTui
             }
 
             history.Add(new ChatEntry("assistant", answer));
-            RenderPanel("assistant", string.IsNullOrWhiteSpace(answer) ? "(no text response)" : answer, Color.Green);
+            historyStore.Append(workspace.RootPath, settings.ProviderName, settings.Model, sessionId, "assistant", answer);
+            lastAnswer = answer;
+            try
+            {
+                JsonElement? snapshot = await service.SerializeSessionAsync();
+                if (snapshot.HasValue)
+                {
+                    historyStore.SaveSessionSnapshot(workspace.RootPath, settings.ProviderName, sessionId, snapshot.Value);
+                }
+            }
+            catch (Exception exception)
+            {
+                AnsiConsole.MarkupLine($"[yellow]Agent セッションの履歴保存をスキップしました: {Markup.Escape(exception.Message)}[/]");
+            }
+
+            RenderPanel("回答", string.IsNullOrWhiteSpace(answer) ? "(テキスト応答なし)" : answer, Color.Green);
         }
         catch (Exception exception)
         {
-            RenderPanel("error", exception.Message, Color.Red);
+            RenderPanel("エラー", exception.Message, Color.Red);
+        }
+    }
+
+    private Task HandleAgentUpdateAsync(AgentResponseUpdate update)
+    {
+        foreach (AIContent content in update.Contents)
+        {
+            switch (content)
+            {
+                case FunctionCallContent functionCall:
+                    RenderToolCall(functionCall);
+                    break;
+                case FunctionResultContent functionResult:
+                    RenderToolResult(functionResult);
+                    break;
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private void LoadCurrentHistory()
+    {
+        history.Clear();
+        IReadOnlyList<ConversationHistoryEntry> entries = historyStore.LoadRecent(
+            workspace.RootPath,
+            settings.ProviderName,
+            maximumEntries: 200,
+            sessionId: sessionId);
+        history.AddRange(entries.Select(entry => new ChatEntry(entry.Role, entry.Text)));
+        turnNumber = entries.Count(entry => entry.Role.Equals("user", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private async Task RestoreSelectedAgentSessionAsync()
+    {
+        if (mafService is null)
+        {
+            return;
+        }
+
+        JsonElement? snapshot = historyStore.LoadSessionSnapshot(
+            workspace.RootPath,
+            settings.ProviderName,
+            sessionId);
+        if (!snapshot.HasValue)
+        {
+            mafService.RestoreTextHistory(ToChatMessages(history));
+            return;
+        }
+
+        try
+        {
+            await mafService.RestoreSessionAsync(snapshot.Value);
+        }
+        catch (Exception exception)
+        {
+            RenderPanel("履歴", $"保存済み Agent セッションを復元できませんでした。新しいセッションで開始します。\n{exception.Message}", Color.Yellow);
+            await mafService.ResetSessionAsync();
+        }
+    }
+
+    private async Task StartNewHistoryAsync()
+    {
+        sessionId = Guid.NewGuid().ToString("N");
+        history.Clear();
+        turnNumber = 0;
+        activeToolCalls.Clear();
+        toolCallViews.Clear();
+        lastAnswer = null;
+        if (mafService is not null)
+        {
+            await mafService.ResetSessionAsync();
+        }
+
+        RenderPanel("履歴", "新しい履歴を開始しました。最初の依頼が履歴名になります。", Color.Green);
+    }
+
+    private async Task UseHistoryAsync(string requestedId)
+    {
+        string? resolvedId = historyStore.ResolveSessionId(workspace.RootPath, settings.ProviderName, requestedId);
+        if (resolvedId is null)
+        {
+            RenderPanel("履歴", "履歴 ID が見つからないか、候補が複数あります。/history list で確認してください。", Color.Red);
+            return;
+        }
+
+        sessionId = resolvedId;
+        LoadCurrentHistory();
+        activeToolCalls.Clear();
+        toolCallViews.Clear();
+        lastAnswer = null;
+        if (mafService is not null)
+        {
+            JsonElement? snapshot = historyStore.LoadSessionSnapshot(workspace.RootPath, settings.ProviderName, sessionId);
+            if (snapshot.HasValue)
+            {
+                try
+                {
+                    await mafService.RestoreSessionAsync(snapshot.Value);
+                }
+                catch (Exception exception)
+                {
+                    await mafService.ResetSessionAsync();
+                    RenderPanel("履歴", $"Agent セッションを復元できなかったため、新しい Agent セッションで表示履歴を開きました。\n{exception.Message}", Color.Yellow);
+                }
+            }
+            else
+            {
+                await mafService.ResetSessionAsync();
+                mafService.RestoreTextHistory(ToChatMessages(history));
+            }
+        }
+
+        ConversationHistorySession? session = historyStore.ListSessions(workspace.RootPath, settings.ProviderName)
+            .FirstOrDefault(item => item.SessionId.Equals(sessionId, StringComparison.OrdinalIgnoreCase));
+        RenderPanel("履歴", $"履歴を切り替えました。\n{session?.Title ?? sessionId[..Math.Min(8, sessionId.Length)]}", Color.Green);
+    }
+
+    private async Task DeleteHistoryAsync(string requestedId)
+    {
+        string? resolvedId = historyStore.ResolveSessionId(workspace.RootPath, settings.ProviderName, requestedId);
+        if (resolvedId is null)
+        {
+            RenderPanel("履歴", "履歴 ID が見つからないか、候補が複数あります。/history list で確認してください。", Color.Red);
+            return;
+        }
+
+        bool deleted = historyStore.DeleteSession(workspace.RootPath, settings.ProviderName, resolvedId);
+        if (resolvedId.Equals(sessionId, StringComparison.OrdinalIgnoreCase))
+        {
+            sessionId = historyStore.GetLatestSessionId(workspace.RootPath, settings.ProviderName)
+                ?? Guid.NewGuid().ToString("N");
+            LoadCurrentHistory();
+            toolCallViews.Clear();
+            lastAnswer = null;
+            if (mafService is not null)
+            {
+                await mafService.ResetSessionAsync();
+            }
+        }
+
+        RenderPanel("履歴", deleted ? "履歴を削除しました。" : "削除する履歴がありません。", deleted ? Color.Green : Color.Yellow);
+    }
+
+    private void RenderToolCall(FunctionCallContent functionCall)
+    {
+        string callId = string.IsNullOrWhiteSpace(functionCall.CallId) ? "(idなし)" : functionCall.CallId;
+        string name = string.IsNullOrWhiteSpace(functionCall.Name) ? "unknown_tool" : functionCall.Name;
+        string arguments = functionCall.Arguments is null || functionCall.Arguments.Count == 0
+            ? "(引数なし)"
+            : JsonSerializer.Serialize(functionCall.Arguments, new JsonSerializerOptions { WriteIndented = true });
+        ToolCallView view = GetOrCreateToolCallView(callId, name);
+        view.Arguments = arguments;
+        RenderToolCallPanel(view);
+    }
+
+    private void RenderToolResult(FunctionResultContent functionResult)
+    {
+        string callId = string.IsNullOrWhiteSpace(functionResult.CallId) ? "(idなし)" : functionResult.CallId;
+        ToolCallView view = GetOrCreateToolCallView(callId, "tool");
+        string result = functionResult.Exception is null
+            ? functionResult.Result?.ToString() ?? "(結果なし)"
+            : $"{functionResult.Exception.GetType().Name}: {functionResult.Exception.Message}";
+        view.Result = result;
+        view.HasResult = true;
+        view.Succeeded = functionResult.Exception is null;
+        RenderToolResultPanel(view);
+    }
+
+    private ToolCallView GetOrCreateToolCallView(string callId, string name)
+    {
+        if (activeToolCalls.TryGetValue(callId, out ToolCallView? existing))
+        {
+            return existing;
+        }
+
+        ToolCallView view = new(callId, name);
+        activeToolCalls[callId] = view;
+        toolCallViews.Add(view);
+        return view;
+    }
+
+    private void ResetToolCallDisplayOverrides()
+    {
+        foreach (ToolCallView view in toolCallViews)
+        {
+            view.ExpandedOverride = null;
+        }
+    }
+
+    private void RenderToolCallPanel(ToolCallView view)
+    {
+        view.CallStartRow = CurrentConsoleRow();
+        if (!IsToolCallExpanded(view))
+        {
+            string summary = $"▶ {view.Name}\nCall ID: {view.CallId}\n引数: 折りたたみ中（クリックで展開）";
+            AnsiConsole.Write(new Panel(new Text(summary))
+                .Header($"[cyan]Tool Call · collapsed[/] [bold]{Markup.Escape(view.Name)}[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(Color.Cyan1));
+        }
+        else
+        {
+            string body = $"Tool: {view.Name}\nCall ID: {view.CallId}\n\nArguments:\n{Truncate(view.Arguments, 5_000)}";
+            AnsiConsole.Write(new Panel(new Text(body))
+                .Header($"[cyan]Tool Call[/] [bold]{Markup.Escape(view.Name)}[/] [grey](クリックで折りたたみ)[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(Color.Cyan1));
+        }
+
+        view.CallEndRow = CurrentConsoleRow();
+    }
+
+    private void RenderToolResultPanel(ToolCallView view)
+    {
+        Color color = view.Succeeded ? Color.Green : Color.Red;
+        view.ResultStartRow = CurrentConsoleRow();
+
+        if (!IsToolCallExpanded(view))
+        {
+            string status = view.Succeeded ? "完了" : "失敗";
+            string summary = $"{(view.Succeeded ? "✓" : "✗")} {view.Name}\nCall ID: {view.CallId}\n結果: {status}（クリックで展開）";
+            AnsiConsole.Write(new Panel(new Text(summary))
+                .Header($"[{color.ToMarkup()}]Tool Result · collapsed[/] [bold]{Markup.Escape(view.Name)}[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(color));
+        }
+        else
+        {
+            string body = $"Tool: {view.Name}\nCall ID: {view.CallId}\n\n{Truncate(view.Result ?? "(結果なし)", 5_000)}";
+            AnsiConsole.Write(new Panel(new Text(body))
+                .Header($"[{color.ToMarkup()}]Tool Result[/] [bold]{Markup.Escape(view.Name)}[/] [grey](クリックで折りたたみ)[/]")
+                .Border(BoxBorder.Rounded)
+                .BorderColor(color));
+        }
+
+        view.ResultEndRow = CurrentConsoleRow();
+    }
+
+    private bool IsToolCallExpanded(ToolCallView view) =>
+        view.ExpandedOverride ?? !toolCallsCollapsed;
+
+    private void RenderToolCallViews()
+    {
+        foreach (ToolCallView view in toolCallViews)
+        {
+            RenderToolCallPanel(view);
+            if (view.HasResult)
+            {
+                RenderToolResultPanel(view);
+            }
         }
     }
 
@@ -113,6 +411,43 @@ internal sealed class AegisTui
             return true;
         }
 
+        if (input.Equals("/toolcalls", StringComparison.OrdinalIgnoreCase))
+        {
+            RenderToolCallMode();
+            return true;
+        }
+
+        if (input.Equals("/toolcalls collapse", StringComparison.OrdinalIgnoreCase) ||
+            input.Equals("/tools collapse", StringComparison.OrdinalIgnoreCase))
+        {
+            toolCallsCollapsed = true;
+            ResetToolCallDisplayOverrides();
+            RenderPanel("Tool Call", "以降の Tool Call / Result を折りたたんで表示します。/toolcalls expand で展開表示に戻せます。", Color.Cyan1);
+            return true;
+        }
+
+        if (input.Equals("/toolcalls expand", StringComparison.OrdinalIgnoreCase) ||
+            input.Equals("/tools expand", StringComparison.OrdinalIgnoreCase))
+        {
+            toolCallsCollapsed = false;
+            ResetToolCallDisplayOverrides();
+            RenderPanel("Tool Call", "以降の Tool Call / Result を詳細表示します。", Color.Cyan1);
+            return true;
+        }
+
+        if (input.Equals("/toolcalls toggle", StringComparison.OrdinalIgnoreCase))
+        {
+            toolCallsCollapsed = !toolCallsCollapsed;
+            RenderToolCallMode();
+            return true;
+        }
+
+        if (input.Equals("/tools", StringComparison.OrdinalIgnoreCase))
+        {
+            RenderTools();
+            return true;
+        }
+
         if (input.Equals("/clear", StringComparison.OrdinalIgnoreCase))
         {
             if (mafService is not null)
@@ -120,10 +455,15 @@ internal sealed class AegisTui
                 await mafService.ResetSessionAsync();
             }
 
+            sessionId = Guid.NewGuid().ToString("N");
             history.Clear();
             turnNumber = 0;
+            activeToolCalls.Clear();
+            toolCallViews.Clear();
+            lastAnswer = null;
             TryClear();
             RenderWelcome();
+            RenderPanel("履歴", "新しい履歴を開始しました。以前の履歴は /history list から選べます。", Color.Green);
             return true;
         }
 
@@ -136,6 +476,85 @@ internal sealed class AegisTui
         if (input.Equals("/workspace", StringComparison.OrdinalIgnoreCase))
         {
             RenderPanel("workspace", workspace.RootPath, Color.Grey);
+            return true;
+        }
+
+        if (input.Equals("/history", StringComparison.OrdinalIgnoreCase))
+        {
+            RenderHistory();
+            return true;
+        }
+
+        if (input.Equals("/history list", StringComparison.OrdinalIgnoreCase))
+        {
+            RenderHistorySessions();
+            return true;
+        }
+
+        if (input.Equals("/history new", StringComparison.OrdinalIgnoreCase))
+        {
+            await StartNewHistoryAsync();
+            return true;
+        }
+
+        if (input.Equals("/history use", StringComparison.OrdinalIgnoreCase))
+        {
+            await SelectHistoryAsync();
+            return true;
+        }
+
+        if (input.Equals("/history clear", StringComparison.OrdinalIgnoreCase))
+        {
+            bool cleared = historyStore.Clear(workspace.RootPath, settings.ProviderName);
+            sessionId = Guid.NewGuid().ToString("N");
+            history.Clear();
+            turnNumber = 0;
+            activeToolCalls.Clear();
+            toolCallViews.Clear();
+            lastAnswer = null;
+            if (mafService is not null)
+            {
+                await mafService.ResetSessionAsync();
+            }
+
+            RenderPanel("履歴", cleared ? "この workspace の全履歴を削除し、新しい履歴を開始しました。" : "削除する保存履歴はありません。新しい履歴を開始しました。", Color.Green);
+            return true;
+        }
+
+        if (input.StartsWith("/history use ", StringComparison.OrdinalIgnoreCase))
+        {
+            await UseHistoryAsync(input["/history use ".Length..].Trim());
+            return true;
+        }
+
+        if (input.StartsWith("/history delete ", StringComparison.OrdinalIgnoreCase))
+        {
+            await DeleteHistoryAsync(input["/history delete ".Length..].Trim());
+            return true;
+        }
+
+        if (input.Equals("/model", StringComparison.OrdinalIgnoreCase) ||
+            input.Equals("/model list", StringComparison.OrdinalIgnoreCase))
+        {
+            await RenderModelsAsync();
+            return true;
+        }
+
+        if (input.StartsWith("/model ", StringComparison.OrdinalIgnoreCase))
+        {
+            string modelCommand = input["/model ".Length..].Trim();
+            string model = modelCommand.StartsWith("use ", StringComparison.OrdinalIgnoreCase)
+                ? modelCommand["use ".Length..].Trim()
+                : modelCommand;
+            if (string.IsNullOrWhiteSpace(model))
+            {
+                RenderPanel("model", "Usage: /model list | /model use <model> | /model <model>", Color.Yellow);
+            }
+            else
+            {
+                await ChangeModelAsync(model);
+            }
+
             return true;
         }
 
@@ -152,6 +571,46 @@ internal sealed class AegisTui
         }
 
         return false;
+    }
+
+    private async Task SelectHistoryAsync()
+    {
+        IReadOnlyList<ConversationHistorySession> sessions = historyStore.ListSessions(
+            workspace.RootPath,
+            settings.ProviderName);
+        if (sessions.Count == 0)
+        {
+            RenderPanel("履歴", "選択できる履歴がありません。先に会話を実行してください。", Color.Yellow);
+            return;
+        }
+
+        if (Console.IsInputRedirected)
+        {
+            RenderHistorySessions();
+            RenderPanel("履歴", "/history use <id> で履歴 ID を指定してください。", Color.Yellow);
+            return;
+        }
+
+        Dictionary<string, string> choiceToSessionId = new(StringComparer.Ordinal);
+        foreach (ConversationHistorySession session in sessions)
+        {
+            string shortId = session.SessionId[..Math.Min(8, session.SessionId.Length)];
+            string title = session.Title
+                .Replace('[', '（')
+                .Replace(']', '）')
+                .Replace('\r', ' ')
+                .Replace('\n', ' ');
+            string choice = $"{(session.SessionId.Equals(sessionId, StringComparison.OrdinalIgnoreCase) ? "*" : " ")} {shortId}  {title}";
+            choiceToSessionId[choice] = session.SessionId;
+        }
+
+        string selected = AnsiConsole.Prompt(
+            new SelectionPrompt<string>()
+                .Title("[cyan]開く履歴を選択してください[/]")
+                .PageSize(Math.Max(3, Math.Min(12, choiceToSessionId.Count)))
+                .MoreChoicesText("[grey]上下キーで移動、Enter で決定[/]")
+                .AddChoices(choiceToSessionId.Keys));
+        await UseHistoryAsync(choiceToSessionId[selected]);
     }
 
     private async Task HandleProviderCommandAsync(string input)
@@ -196,39 +655,65 @@ internal sealed class AegisTui
         string type = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
                 .Title("登録するプロバイダーを選択")
-                .AddChoices("OpenAI API", "DeepSeek", "OpenAI-compatible", "OpenAI ChatGPT OAuth (Codex app-server)"));
+                .AddChoices(
+                    "OpenAI API",
+                    "DeepSeek",
+                    "Anthropic Claude",
+                    "Ollama (ローカル)",
+                    "llama.cpp (ローカル)",
+                    "vLLM (ローカル)",
+                    "LM Studio (ローカル)",
+                    "OpenRouter (OSSモデル)",
+                    "OpenAI-compatible",
+                    "OpenAI ChatGPT OAuth (OpenCode-style PKCE)"));
         string name = AnsiConsole.Ask<string>("プロファイル名:");
 
         if (type.StartsWith("OpenAI ChatGPT", StringComparison.Ordinal))
         {
-            providerRegistry.Upsert(name, "openai-chatgpt-oauth", "gpt-6-sol", null, null, null);
+            providerRegistry.Upsert(name, ProviderKinds.ChatGptOAuth, ChatGptOAuthCredentialStore.DefaultModel, null, null, null);
             providerRegistry.SetActive(name);
-            RenderPanel("provider", "OAuth プロファイルを保存しました。/auth openai でログインしてから再起動してください。", Color.Green);
+            RenderPanel("provider", "OAuth プロファイルを保存しました。/auth openai でログインしてください。", Color.Green);
             return;
         }
 
+        string kind = type switch
+        {
+            "OpenAI API" => ProviderKinds.OpenAi,
+            "DeepSeek" => ProviderKinds.DeepSeek,
+            "Anthropic Claude" => ProviderKinds.Anthropic,
+            "Ollama (ローカル)" => ProviderKinds.Ollama,
+            "llama.cpp (ローカル)" => ProviderKinds.LlamaCpp,
+            "vLLM (ローカル)" => ProviderKinds.Vllm,
+            "LM Studio (ローカル)" => ProviderKinds.LmStudio,
+            "OpenRouter (OSSモデル)" => ProviderKinds.OpenRouter,
+            _ => ProviderKinds.OpenAiCompatible,
+        };
         string defaultModel = type switch
         {
-            "DeepSeek" => "deepseek-chat",
-            "OpenAI API" => "gpt-4.1-mini",
-            _ => "gpt-4.1-mini",
+            _ when kind == ProviderKinds.DeepSeek => ProviderKinds.DefaultModel(kind),
+            _ when kind == ProviderKinds.Anthropic => ProviderKinds.DefaultModel(kind),
+            _ when ProviderKinds.IsLocal(kind) => ProviderKinds.DefaultModel(kind),
+            _ when kind == ProviderKinds.OpenRouter => ProviderKinds.DefaultModel(kind),
+            _ => ProviderKinds.DefaultModel(ProviderKinds.OpenAi),
         };
-        string defaultBaseUrl = type switch
+        string defaultBaseUrl = kind switch
         {
-            "DeepSeek" => "https://api.deepseek.com/v1",
-            "OpenAI API" => "",
-            _ => "https://example.com/v1",
+            ProviderKinds.OpenAi => "",
+            _ => ProviderKinds.DefaultBaseUrl(kind) ?? "http://localhost:8000/v1",
         };
         string model = AnsiConsole.Ask("モデル名:", defaultModel);
-        string baseUrl = AnsiConsole.Ask("Base URL（OpenAI は空欄）:", defaultBaseUrl);
-        string apiKeyEnv = AnsiConsole.Ask("API キーを読む環境変数名（空欄なら暗号化保存）:", "");
-        string? apiKey = string.IsNullOrWhiteSpace(apiKeyEnv)
-            ? AnsiConsole.Prompt(new TextPrompt<string>("API キー:").Secret())
-            : null;
+        string baseUrl = AnsiConsole.Ask("Base URL（既定値のまま Enter で利用）:", defaultBaseUrl);
+        bool localProvider = ProviderKinds.IsLocal(kind);
+        string apiKeyEnv = localProvider
+            ? string.Empty
+            : AnsiConsole.Ask("API キーを読む環境変数名（空欄なら暗号化保存）:", kind == ProviderKinds.Anthropic ? "ANTHROPIC_API_KEY" : "");
+        string? apiKey = localProvider || !string.IsNullOrWhiteSpace(apiKeyEnv)
+            ? null
+            : AnsiConsole.Prompt(new TextPrompt<string>("API キー:").Secret());
 
         try
         {
-            providerRegistry.Upsert(name, type == "DeepSeek" ? "deepseek" : "openai-compatible", model, baseUrl, apiKey, apiKeyEnv);
+            providerRegistry.Upsert(name, kind, model, baseUrl, apiKey, apiKeyEnv);
             providerRegistry.SetActive(name);
             RenderPanel("provider", $"{name} を保存しました。次回起動から利用します。", Color.Green);
         }
@@ -242,57 +727,547 @@ internal sealed class AegisTui
 
     private async Task LoginOpenAiAsync()
     {
-        if (codex is not null)
+        if (oauth is null)
         {
-            try
-            {
-                bool success = await codex.LoginWithChatGptAsync();
-                RenderPanel("OpenAI OAuth", success ? "ChatGPT OAuth に成功しました。" : "OAuth に失敗しました。", success ? Color.Green : Color.Red);
-            }
-            catch (Exception exception)
-            {
-                RenderPanel("OpenAI OAuth", exception.Message, Color.Red);
-            }
-
+            RenderPanel("OpenAI OAuth", "ChatGPT OAuth プロファイルを選択してから実行してください。", Color.Yellow);
             return;
         }
 
-        await using CodexAppServerClient temporary = new(
-            workspace.RootPath,
-            "gpt-6-sol",
-            PromptApprovalAsync);
         try
         {
-            await temporary.StartAsync();
-            bool success = await temporary.LoginWithChatGptAsync();
+            bool success = await oauth.LoginAsync();
             if (success)
             {
-                providerRegistry.Upsert("openai-chatgpt", "openai-chatgpt-oauth", "gpt-6-sol", null, null, null);
-                providerRegistry.SetActive("openai-chatgpt");
+                ProviderProfile? active = providerRegistry.Resolve();
+                string providerName = active?.Kind.Equals("openai-chatgpt-oauth", StringComparison.OrdinalIgnoreCase) == true
+                    ? active.Name
+                    : "openai-chatgpt";
+                string model = active?.Kind.Equals("openai-chatgpt-oauth", StringComparison.OrdinalIgnoreCase) == true
+                    ? active.Model
+                    : ChatGptOAuthCredentialStore.DefaultModel;
+                providerRegistry.Upsert(providerName, "openai-chatgpt-oauth", model, null, null, null);
+                providerRegistry.SetActive(providerName);
+                ProviderProfile profile = providerRegistry.Resolve(providerName)!;
+                settings = AgentSettings.Load(settings.Model, null, profile);
+                mafService = await MafCodingAgentService.CreateAsync(settings, workspace, oauth);
+                await mafService.InitializeAsync();
             }
 
-            RenderPanel("OpenAI OAuth", success ? "ChatGPT OAuth に成功しました。次回起動ではこのプロバイダーを使います。" : "OAuth に失敗しました。", success ? Color.Green : Color.Red);
+            RenderPanel("OpenAI OAuth", success ? "ChatGPT OAuth に成功しました。Codex CLI なしで接続します。" : "OAuth に失敗しました。", success ? Color.Green : Color.Red);
         }
         catch (Exception exception)
         {
-            RenderPanel("OpenAI OAuth", exception.Message + "（Codex CLI / app-server が必要です）", Color.Red);
+            RenderPanel("OpenAI OAuth", exception.Message, Color.Red);
         }
     }
 
-    private Task<string> PromptApprovalAsync(string action)
+    private async Task ChangeModelAsync(string model)
     {
-        bool accepted = AnsiConsole.Confirm($"[yellow]許可しますか？[/] {Markup.Escape(action)}", false);
-        return Task.FromResult(accepted ? "accept" : "decline");
+        ProviderProfile? profile = providerRegistry.Resolve();
+        if (profile is not null)
+        {
+            providerRegistry.SetModel(profile.Name, model);
+        }
+
+        settings = settings with { Model = model };
+        try
+        {
+            if (settings.BackendKind.Equals("maf-chatgpt-oauth", StringComparison.OrdinalIgnoreCase))
+            {
+                mafService = oauth?.HasStoredCredential == true
+                    ? await MafCodingAgentService.CreateAsync(settings, workspace, oauth)
+                    : null;
+            }
+            else if (!string.IsNullOrWhiteSpace(settings.ApiKey))
+            {
+                mafService = MafCodingAgentService.Create(settings, workspace);
+            }
+
+            if (mafService is not null)
+            {
+                await mafService.InitializeAsync();
+            }
+
+            string persistence = profile is null ? "現在のセッションのみ" : "保存済みプロファイルにも反映";
+            RenderPanel("model", $"モデルを {model} に変更しました（{persistence}）。", Color.Green);
+        }
+        catch (Exception exception)
+        {
+            RenderPanel("model", exception.Message, Color.Red);
+        }
     }
 
-    private static string ReadInput()
+    private async Task RenderModelsAsync()
+    {
+        ProviderProfile? profile = providerRegistry.Resolve();
+        try
+        {
+            IReadOnlyList<string> discovered = await ModelCatalog.DiscoverAsync(settings);
+            if (discovered.Count > 0)
+            {
+                discoveredModels = discovered;
+                AnsiConsole.MarkupLine($"[grey]{discovered.Count} モデルを endpoint から取得しました。[/]");
+            }
+        }
+        catch (Exception exception)
+        {
+            AnsiConsole.MarkupLine($"[yellow]モデル一覧の取得に失敗しました: {Markup.Escape(exception.Message)}[/]");
+        }
+
+        IReadOnlyList<string> models = ModelCatalog.GetSuggestions(profile, settings.Model, discoveredModels);
+        Table table = new Table()
+            .Border(TableBorder.Rounded)
+            .AddColumn("Active")
+            .AddColumn("Model")
+            .AddColumn("操作");
+
+        foreach (string model in models)
+        {
+            table.AddRow(
+                model.Equals(settings.Model, StringComparison.OrdinalIgnoreCase) ? "*" : "",
+                Markup.Escape(model),
+                Markup.Escape($"/model use {model}"));
+        }
+
+        AnsiConsole.Write(table);
+        AnsiConsole.MarkupLine("[grey]候補外のモデルも /model use <model> で指定できます。[/]");
+    }
+
+    private void RenderHistory()
+    {
+        IReadOnlyList<ConversationHistoryEntry> entries = historyStore.LoadRecent(
+            workspace.RootPath,
+            settings.ProviderName,
+            maximumEntries: 40,
+            sessionId: sessionId);
+        if (entries.Count == 0)
+        {
+            RenderPanel("履歴", "この履歴には保存されたメッセージがありません。/history list で履歴一覧を確認できます。", Color.Yellow);
+            return;
+        }
+
+        Table table = new Table()
+            .Border(TableBorder.Rounded)
+            .AddColumn("時刻")
+            .AddColumn("Role")
+            .AddColumn("Model")
+            .AddColumn("内容");
+        foreach (ConversationHistoryEntry entry in entries)
+        {
+            string text = entry.Text.Replace('\n', ' ');
+            text = text[..Math.Min(text.Length, 100)];
+            table.AddRow(
+                entry.Timestamp.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
+                Markup.Escape(entry.Role),
+                Markup.Escape(entry.Model),
+                Markup.Escape(text));
+        }
+
+        AnsiConsole.Write(table);
+        AnsiConsole.MarkupLine("[grey]/history list: 一覧    /history new: 新規    /history use <id>: 切替[/]");
+    }
+
+    private void RenderHistorySessions()
+    {
+        IReadOnlyList<ConversationHistorySession> sessions = historyStore.ListSessions(
+            workspace.RootPath,
+            settings.ProviderName);
+        if (sessions.Count == 0)
+        {
+            RenderPanel("履歴一覧", "この workspace・provider に保存された履歴はありません。/history new で新規作成できます。", Color.Yellow);
+            return;
+        }
+
+        Table table = new Table()
+            .Border(TableBorder.Rounded)
+            .AddColumn("Active")
+            .AddColumn("ID")
+            .AddColumn("最終更新")
+            .AddColumn("件数")
+            .AddColumn("Model")
+            .AddColumn("履歴名");
+        foreach (ConversationHistorySession session in sessions)
+        {
+            table.AddRow(
+                session.SessionId.Equals(sessionId, StringComparison.OrdinalIgnoreCase) ? "*" : "",
+                Markup.Escape(session.SessionId[..Math.Min(8, session.SessionId.Length)]),
+                session.LastActivity.ToLocalTime().ToString("yyyy-MM-dd HH:mm"),
+                session.MessageCount.ToString(),
+                Markup.Escape(session.Model),
+                Markup.Escape(session.Title));
+        }
+
+        AnsiConsole.Write(table);
+        AnsiConsole.MarkupLine("[grey]/history use <ID>: 開く    /history new: 新規    /history delete <ID>: 削除    /history clear: 全削除[/]");
+    }
+
+    private IReadOnlyList<string> GetInputSuggestions(string input)
+    {
+        if (!input.StartsWith("/", StringComparison.Ordinal))
+        {
+            return [];
+        }
+
+        if (input.StartsWith("/model use ", StringComparison.OrdinalIgnoreCase))
+        {
+            string prefix = input["/model use ".Length..];
+            return GetModelSuggestions()
+                .Where(model => model.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .Select(model => $"/model use {model}")
+                .Take(8)
+                .ToArray();
+        }
+
+        string? historyCommand = input.StartsWith("/history use ", StringComparison.OrdinalIgnoreCase)
+            ? "/history use "
+            : input.StartsWith("/history delete ", StringComparison.OrdinalIgnoreCase)
+                ? "/history delete "
+                : null;
+        if (historyCommand is not null)
+        {
+            string prefix = input[historyCommand.Length..].Trim();
+            return historyStore.ListSessions(workspace.RootPath, settings.ProviderName)
+                .Select(session => session.SessionId)
+                .Where(id => id.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .Select(id => historyCommand + id)
+                .Take(8)
+                .ToArray();
+        }
+
+        string[] commands =
+        [
+            "/help",
+            "/toolcalls",
+            "/toolcalls collapse",
+            "/toolcalls expand",
+            "/tools",
+            "/model list",
+            "/model use ",
+            "/provider list",
+            "/provider add",
+            "/provider use ",
+            "/auth openai",
+            "/history",
+            "/history list",
+            "/history new",
+            "/history use ",
+            "/history delete ",
+            "/history clear",
+            "/status",
+            "/workspace",
+            "/clear",
+            "/exit",
+        ];
+
+        return commands
+            .Where(command => command.StartsWith(input, StringComparison.OrdinalIgnoreCase))
+            .Take(8)
+            .ToArray();
+    }
+
+    private IReadOnlyList<string> GetModelSuggestions()
+    {
+        return ModelCatalog.GetSuggestions(providerRegistry.Resolve(), settings.Model, discoveredModels);
+    }
+
+    private string ReadInput()
     {
         if (Console.IsInputRedirected)
         {
             return Console.ReadLine() ?? "/exit";
         }
 
-        return AnsiConsole.Ask<string>("[bold deepskyblue1]aegis[/]> ");
+        const string prompt = "aegis> ";
+        StringBuilder buffer = new();
+        int selectedSuggestion = -1;
+        int renderedSuggestionLines = 0;
+        bool previousTreatControlCAsInput = Console.TreatControlCAsInput;
+        Console.TreatControlCAsInput = true;
+
+        try
+        {
+            while (true)
+            {
+                IReadOnlyList<string> suggestions = GetInputSuggestions(buffer.ToString());
+                if (selectedSuggestion >= suggestions.Count)
+                {
+                    selectedSuggestion = suggestions.Count - 1;
+                }
+
+                renderedSuggestionLines = RenderInputLine(
+                    prompt,
+                    buffer.ToString(),
+                    suggestions,
+                    selectedSuggestion,
+                    renderedSuggestionLines);
+                ConsoleKeyInfo key = Console.ReadKey(intercept: true);
+
+                if (key.Key == ConsoleKey.Escape &&
+                    TryReadMouseClick(out int mouseRow))
+                {
+                    if (ToggleToolCallAtRow(
+                        mouseRow,
+                        prompt,
+                        buffer.ToString(),
+                        suggestions,
+                        selectedSuggestion,
+                        ref renderedSuggestionLines))
+                    {
+                        continue;
+                    }
+
+                    // Mouse clicks outside a Tool Call are intentionally ignored.
+                    continue;
+                }
+
+                if (key.Key == ConsoleKey.C && key.Modifiers.HasFlag(ConsoleModifiers.Control))
+                {
+                    throw new OperationCanceledException();
+                }
+
+                if (key.Key == ConsoleKey.Enter)
+                {
+                    RenderInputLine(prompt, buffer.ToString(), [], -1, renderedSuggestionLines);
+                    Console.WriteLine();
+                    return buffer.ToString();
+                }
+
+                if (key.Key == ConsoleKey.Backspace)
+                {
+                    if (buffer.Length > 0)
+                    {
+                        buffer.Length--;
+                    }
+
+                    selectedSuggestion = -1;
+                    continue;
+                }
+
+                if (key.Key == ConsoleKey.UpArrow && suggestions.Count > 0)
+                {
+                    selectedSuggestion = selectedSuggestion <= 0 ? suggestions.Count - 1 : selectedSuggestion - 1;
+                    continue;
+                }
+
+                if (key.Key == ConsoleKey.DownArrow && suggestions.Count > 0)
+                {
+                    selectedSuggestion = selectedSuggestion >= suggestions.Count - 1 ? 0 : selectedSuggestion + 1;
+                    continue;
+                }
+
+                if (key.Key == ConsoleKey.Tab && suggestions.Count > 0)
+                {
+                    buffer.Clear();
+                    buffer.Append(suggestions[selectedSuggestion < 0 ? 0 : selectedSuggestion]);
+                    selectedSuggestion = -1;
+                    continue;
+                }
+
+                if (key.Key == ConsoleKey.Escape)
+                {
+                    buffer.Clear();
+                    selectedSuggestion = -1;
+                    continue;
+                }
+
+                if (!char.IsControl(key.KeyChar))
+                {
+                    buffer.Append(key.KeyChar);
+                    selectedSuggestion = -1;
+                }
+            }
+        }
+        finally
+        {
+            Console.TreatControlCAsInput = previousTreatControlCAsInput;
+        }
+    }
+
+    private bool ToggleToolCallAtRow(
+        int mouseRow,
+        string prompt,
+        string input,
+        IReadOnlyList<string> suggestions,
+        int selectedSuggestion,
+        ref int renderedSuggestionLines)
+    {
+        ToolCallView? view = toolCallViews.FirstOrDefault(item => item.ContainsRow(mouseRow));
+        if (view is null)
+        {
+            return false;
+        }
+
+        view.ExpandedOverride = !IsToolCallExpanded(view);
+        TryClear();
+        RenderWelcome();
+        RenderDashboard();
+        RenderToolCallViews();
+        if (lastAnswer is not null)
+        {
+            RenderPanel("回答", string.IsNullOrWhiteSpace(lastAnswer) ? "(テキスト応答なし)" : lastAnswer, Color.Green);
+        }
+
+        renderedSuggestionLines = RenderInputLine(
+            prompt,
+            input,
+            suggestions,
+            selectedSuggestion,
+            previousSuggestionLines: 0);
+        return true;
+    }
+
+    private static bool TryReadMouseClick(out int row)
+    {
+        row = 0;
+        if (!WaitForInputKey())
+        {
+            return false;
+        }
+
+        ConsoleKeyInfo openingBracket = Console.ReadKey(intercept: true);
+        if (openingBracket.KeyChar != '[' || !WaitForInputKey())
+        {
+            return false;
+        }
+
+        ConsoleKeyInfo sgrMarker = Console.ReadKey(intercept: true);
+        if (sgrMarker.KeyChar != '<')
+        {
+            return false;
+        }
+
+        StringBuilder payload = new();
+        char terminator = '\0';
+        while (WaitForInputKey(25))
+        {
+            char value = Console.ReadKey(intercept: true).KeyChar;
+            if (value is 'M' or 'm')
+            {
+                terminator = value;
+                break;
+            }
+
+            payload.Append(value);
+            if (payload.Length > 32)
+            {
+                return false;
+            }
+        }
+
+        if (terminator != 'M')
+        {
+            return false;
+        }
+
+        string[] parts = payload.ToString().Split(';');
+        return parts.Length == 3 &&
+            int.TryParse(parts[0], out int button) &&
+            int.TryParse(parts[2], out row) &&
+            (button & 3) == 0;
+    }
+
+    private static bool WaitForInputKey(int timeoutMilliseconds = 25)
+    {
+        long deadline = Environment.TickCount64 + timeoutMilliseconds;
+        while (!Console.KeyAvailable && Environment.TickCount64 < deadline)
+        {
+            Thread.Sleep(1);
+        }
+
+        return Console.KeyAvailable;
+    }
+
+    private static int RenderInputLine(
+        string prompt,
+        string input,
+        IReadOnlyList<string> suggestions,
+        int selectedSuggestion,
+        int previousSuggestionLines)
+    {
+        Console.Write("\r\u001b[2K");
+        EnsureSuggestionSpace(suggestions.Count);
+        Console.Write(prompt);
+        Console.Write(input);
+
+        // Keep the cursor at the end of the input while the lines below it are redrawn.
+        Console.Write("\u001b[s");
+
+        if (previousSuggestionLines > 0)
+        {
+            Console.Write("\u001b[1B\r");
+            for (int index = 0; index < previousSuggestionLines; index++)
+            {
+                Console.Write("\u001b[2K");
+                if (index < previousSuggestionLines - 1)
+                {
+                    Console.Write("\u001b[1B\r");
+                }
+            }
+
+            Console.Write("\u001b[u");
+        }
+
+        if (suggestions.Count > 0)
+        {
+            Console.Write("\u001b[1B\r");
+            for (int index = 0; index < suggestions.Count; index++)
+            {
+                Console.Write("\u001b[2K");
+                string marker = index == selectedSuggestion ? "▶ " : "  ";
+                Console.Write($"  {marker}{suggestions[index]}");
+                if (index < suggestions.Count - 1)
+                {
+                    Console.Write("\u001b[1B\r");
+                }
+            }
+        }
+
+        Console.Write("\u001b[u");
+        return suggestions.Count;
+    }
+
+    private static void EnsureSuggestionSpace(int suggestionLines)
+    {
+        if (suggestionLines <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            int bottomRow = Console.WindowTop + Console.WindowHeight - 1;
+            int currentRow = Console.CursorTop;
+            int rowsToReserve = currentRow + suggestionLines - bottomRow;
+            if (rowsToReserve <= 0)
+            {
+                return;
+            }
+
+            // Scroll the viewport first, then move back up so the input line has
+            // enough physical rows below it for the suggestion list.
+            for (int index = 0; index < rowsToReserve; index++)
+            {
+                Console.WriteLine();
+            }
+
+            Console.Write($"\u001b[{rowsToReserve}A\r");
+        }
+        catch (IOException)
+        {
+            // Some redirected or legacy consoles do not expose window dimensions.
+        }
+    }
+
+    private static int CurrentConsoleRow()
+    {
+        try
+        {
+            return Console.GetCursorPosition().Top + 1;
+        }
+        catch (IOException)
+        {
+            return -1;
+        }
     }
 
     private static void TryClear()
@@ -303,30 +1278,59 @@ internal sealed class AegisTui
         }
     }
 
+    private static bool EnableMouseReporting()
+    {
+        if (Console.IsInputRedirected || Console.IsOutputRedirected)
+        {
+            return false;
+        }
+
+        // SGR mouse mode reports click coordinates as ESC[<button;column;rowM.
+        Console.Write("\u001b[?1000h\u001b[?1006h");
+        Console.Out.Flush();
+        return true;
+    }
+
+    private static void DisableMouseReporting()
+    {
+        Console.Write("\u001b[?1006l\u001b[?1000l");
+        Console.Out.Flush();
+    }
+
     private void RenderWelcome()
     {
         AnsiConsole.Write(new FigletText("AEGIS").Centered().Color(Color.DeepSkyBlue1));
         AnsiConsole.Write(new Panel(new Markup("[bold]Microsoft Agent Framework Coding TUI[/]\nPlan · Todo · Tools · Verify"))
             .Border(BoxBorder.Rounded)
             .Header("[deepskyblue1]Aegis Coding Agent[/]"));
-        AnsiConsole.MarkupLine("[grey]依頼を入力。/help、/provider、/auth openai、/exit が使えます。[/]");
+        AnsiConsole.MarkupLine("[grey]依頼はそのまま入力。コマンド: /help /tools /provider /model[/]");
+        AnsiConsole.MarkupLine("[grey]/exit で終了。Tool Call / Result はクリックで個別に展開・折りたたみできます。[/]");
     }
 
     private void RenderDashboard()
     {
-        Table table = new Table().NoBorder().AddColumn(new TableColumn("").Width(18)).AddColumn(new TableColumn(""));
-        table.AddRow("Provider", Markup.Escape(settings.ProviderName));
-        table.AddRow("Backend", Markup.Escape(settings.BackendKind));
-        table.AddRow("Model", Markup.Escape(settings.Model));
-        table.AddRow("Workspace", Markup.Escape(workspace.RootPath));
-        table.AddRow("Turns", turnNumber.ToString());
-        if (codex?.AccountSummary is not null)
+        ProviderProfile? profile = providerRegistry.Resolve();
+        string providerKind = profile is null
+            ? settings.BackendKind
+            : ProviderKinds.DisplayName(profile.Kind);
+        string endpoint = settings.BackendKind.Equals("maf-chatgpt-oauth", StringComparison.OrdinalIgnoreCase)
+            ? "ChatGPT Codex"
+            : settings.BaseUrl ?? "OpenAI API";
+        Table table = new Table().NoBorder().AddColumn(new TableColumn("項目").Width(14)).AddColumn(new TableColumn("値"));
+        table.AddRow("プロバイダー", Markup.Escape(settings.ProviderName));
+        table.AddRow("種類", Markup.Escape(providerKind));
+        table.AddRow("モデル", Markup.Escape(settings.Model));
+        table.AddRow("接続先", Markup.Escape(endpoint));
+        table.AddRow("ワークスペース", Markup.Escape(workspace.RootPath));
+        table.AddRow("ターン", turnNumber.ToString());
+        if (oauth is not null &&
+            (settings.BackendKind.Equals("maf-chatgpt-oauth", StringComparison.OrdinalIgnoreCase) || oauth.HasStoredCredential))
         {
-            table.AddRow("Account", Markup.Escape(codex.AccountSummary));
+            table.AddRow("アカウント", Markup.Escape(oauth.AccountSummary));
         }
 
         Grid grid = new Grid().AddColumn().AddColumn();
-        grid.AddRow(new Panel(table).Header("[bold]session[/]").Border(BoxBorder.Rounded), new Panel(new Text(RecentHistory())).Header("[bold]conversation[/]").Border(BoxBorder.Rounded));
+        grid.AddRow(new Panel(table).Header("[bold]接続・セッション[/]").Border(BoxBorder.Rounded), new Panel(new Text(RecentHistory())).Header("[bold]直近の会話[/]").Border(BoxBorder.Rounded));
         AnsiConsole.Write(grid);
     }
 
@@ -366,10 +1370,23 @@ internal sealed class AegisTui
     {
         AnsiConsole.Write(new Panel(new Markup(
             "/help                 この画面\n" +
+            "/toolcalls            Tool Call 表示状態\n" +
+            "/toolcalls collapse   Tool Call / Result を折りたたむ\n" +
+            "/toolcalls expand     Tool Call / Result を詳細表示\n" +
+            "/tools                利用可能な Tool と説明\n" +
             "/provider list        登録済みプロバイダー\n" +
             "/provider add         プロバイダー登録ウィザード\n" +
             "/provider use <name>  次回起動のプロバイダー切替\n" +
             "/auth openai          ChatGPT OAuth ログイン\n" +
+            "/model list           モデル候補一覧\n" +
+            "/model use <model>    モデル切替（/model <model> も可）\n" +
+            "/history              現在の履歴を表示\n" +
+            "/history list         同じ workspace の履歴一覧\n" +
+            "/history new          新しい履歴を開始\n" +
+            "/history use         一覧から履歴を選択\n" +
+            "/history use <id>     ID で履歴を切り替え\n" +
+            "/history delete <id>  履歴を削除\n" +
+            "/history clear        この workspace の履歴を全削除\n" +
             "/status               git status\n" +
             "/clear                会話セッションをクリア\n" +
             "/exit                 終了"))
@@ -377,9 +1394,90 @@ internal sealed class AegisTui
             .Border(BoxBorder.Rounded));
     }
 
+    private void RenderToolCallMode()
+    {
+        string mode = toolCallsCollapsed ? "折りたたみ表示" : "詳細表示";
+        RenderPanel("Tool Call", $"現在の表示: {mode}\n/toolcalls collapse または /toolcalls expand で切り替えできます。", Color.Cyan1);
+    }
+
+    private void RenderTools()
+    {
+        if (mafService is null || mafService.Tools.Count == 0)
+        {
+            RenderPanel("Tool", "利用可能な Tool はありません。プロバイダーを設定してください。", Color.Yellow);
+            return;
+        }
+
+        Table table = new Table()
+            .Border(TableBorder.Rounded)
+            .AddColumn("Tool")
+            .AddColumn("説明");
+        foreach (AITool tool in mafService.Tools)
+        {
+            table.AddRow(
+                Markup.Escape(tool.Name),
+                Markup.Escape(string.IsNullOrWhiteSpace(tool.Description) ? "(説明なし)" : tool.Description));
+        }
+
+        AnsiConsole.Write(table);
+        AnsiConsole.MarkupLine("[grey]ファイル編集・コマンド実行などの Tool は、必要なときに Agent が呼び出します。[/]");
+    }
+
     private static void RenderPanel(string title, string text, Color color)
     {
         AnsiConsole.Write(new Panel(new Text(text)).Header($"[{color.ToMarkup()}]{Markup.Escape(title)}[/]").Border(BoxBorder.Rounded));
+    }
+
+    private static string Truncate(string value, int maximumLength)
+    {
+        if (value.Length <= maximumLength)
+        {
+            return value;
+        }
+
+        return value[..maximumLength] + "\n...(表示を短縮しました)";
+    }
+
+    private static IReadOnlyList<ChatMessage> ToChatMessages(IEnumerable<ChatEntry> entries)
+    {
+        return entries
+            .Where(entry => entry.Role.Equals("user", StringComparison.OrdinalIgnoreCase) ||
+                entry.Role.Equals("assistant", StringComparison.OrdinalIgnoreCase))
+            .Select(entry => new ChatMessage(
+                entry.Role.Equals("user", StringComparison.OrdinalIgnoreCase) ? ChatRole.User : ChatRole.Assistant,
+                entry.Text))
+            .ToArray();
+    }
+
+    private sealed class ToolCallView(string callId, string name)
+    {
+        public string CallId { get; } = callId;
+
+        public string Name { get; } = name;
+
+        public string Arguments { get; set; } = "(引数なし)";
+
+        public string? Result { get; set; }
+
+        public bool HasResult { get; set; }
+
+        public bool Succeeded { get; set; }
+
+        public bool? ExpandedOverride { get; set; }
+
+        public int CallStartRow { get; set; } = -1;
+
+        public int CallEndRow { get; set; } = -1;
+
+        public int ResultStartRow { get; set; } = -1;
+
+        public int ResultEndRow { get; set; } = -1;
+
+        public bool ContainsRow(int row) =>
+            IsWithin(row, CallStartRow, CallEndRow) || IsWithin(row, ResultStartRow, ResultEndRow);
+
+        private static bool IsWithin(int row, int start, int end) =>
+            start > 0 && end >= start && row >= start && row <= end;
     }
 
     private sealed record ChatEntry(string Role, string Text);
