@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Runtime.InteropServices;
 using AegisAgent.Core;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
@@ -23,6 +24,10 @@ internal sealed class AegisTui
     private int turnNumber;
     private bool toolCallsCollapsed;
     private string? lastAnswer;
+    private bool needsConversationViewport;
+    private int conversationScrollOffset;
+    private int maximumConversationScrollOffset;
+    private static uint? originalConsoleInputMode;
 
     public AegisTui(
         AgentSettings settings,
@@ -63,7 +68,19 @@ internal sealed class AegisTui
 
             while (true)
             {
-                RenderDashboard();
+                if (needsConversationViewport)
+                {
+                    // Tool output can be much taller than the terminal. Redraw it
+                    // into a bounded viewport before accepting the next command.
+                    // This also keeps mouse coordinates relative to the visible screen.
+                    needsConversationViewport = false;
+                    RenderConversationViewport();
+                }
+                else
+                {
+                    RenderDashboard();
+                }
+
                 string input;
                 try
                 {
@@ -111,6 +128,8 @@ internal sealed class AegisTui
         activeToolCalls.Clear();
         toolCallViews.Clear();
         lastAnswer = null;
+        conversationScrollOffset = 0;
+        maximumConversationScrollOffset = 0;
         AnsiConsole.Write(new Rule($"[deepskyblue1]Turn {turnNumber}[/]").LeftJustified());
         AnsiConsole.MarkupLine("[grey]依頼を処理中です。Tool Call は下に表示されます。[/]");
 
@@ -145,10 +164,12 @@ internal sealed class AegisTui
             }
 
             RenderPanel("回答", string.IsNullOrWhiteSpace(answer) ? "(テキスト応答なし)" : answer, Color.Green);
+            needsConversationViewport = true;
         }
         catch (Exception exception)
         {
             RenderPanel("エラー", exception.Message, Color.Red);
+            needsConversationViewport = true;
         }
     }
 
@@ -163,6 +184,12 @@ internal sealed class AegisTui
                     break;
                 case FunctionResultContent functionResult:
                     RenderToolResult(functionResult);
+                    break;
+                case WebSearchToolCallContent webSearchCall:
+                    RenderWebSearchCall(webSearchCall);
+                    break;
+                case WebSearchToolResultContent webSearchResult:
+                    RenderWebSearchResult(webSearchResult);
                     break;
             }
         }
@@ -318,6 +345,35 @@ internal sealed class AegisTui
         RenderToolResultPanel(view);
     }
 
+    private void RenderWebSearchCall(WebSearchToolCallContent webSearchCall)
+    {
+        string callId = string.IsNullOrWhiteSpace(webSearchCall.CallId) ? "(idなし)" : webSearchCall.CallId;
+        ToolCallView view = GetOrCreateToolCallView(callId, "WebSearch");
+        if (webSearchCall.Queries is not { Count: > 0 })
+        {
+            return;
+        }
+
+        view.Arguments = string.Join(Environment.NewLine, webSearchCall.Queries);
+        RenderToolCallPanel(view);
+    }
+
+    private void RenderWebSearchResult(WebSearchToolResultContent webSearchResult)
+    {
+        string callId = string.IsNullOrWhiteSpace(webSearchResult.CallId) ? "(idなし)" : webSearchResult.CallId;
+        ToolCallView view = GetOrCreateToolCallView(callId, "WebSearch");
+        view.Result = webSearchResult.Outputs is { Count: > 0 }
+            ? string.Join(
+                Environment.NewLine,
+                webSearchResult.Outputs.Select(output => output is UriContent uri
+                    ? uri.Uri.ToString()
+                    : output.ToString()))
+            : "(検索結果なし)";
+        view.HasResult = true;
+        view.Succeeded = true;
+        RenderToolResultPanel(view);
+    }
+
     private ToolCallView GetOrCreateToolCallView(string callId, string name)
     {
         if (activeToolCalls.TryGetValue(callId, out ToolCallView? existing))
@@ -400,6 +456,191 @@ internal sealed class AegisTui
             {
                 RenderToolResultPanel(view);
             }
+        }
+    }
+
+    private void RenderConversationViewport()
+    {
+        TryClear();
+        RenderCompactHeader();
+
+        foreach (ToolCallView view in toolCallViews)
+        {
+            view.VisibleStartRow = -1;
+            view.VisibleEndRow = -1;
+        }
+
+        IReadOnlyList<ViewportLine> lines = BuildConversationLines();
+        int contentStartRow = CurrentConsoleRow();
+        int availableRows = Math.Max(1, GetConsoleHeight() - contentStartRow - 3);
+        maximumConversationScrollOffset = Math.Max(0, lines.Count - availableRows);
+        conversationScrollOffset = Math.Clamp(
+            conversationScrollOffset,
+            0,
+            maximumConversationScrollOffset);
+
+        int firstLine = Math.Max(0, lines.Count - availableRows - conversationScrollOffset);
+        int lastLine = Math.Min(lines.Count, firstLine + availableRows);
+        for (int index = firstLine; index < lastLine; index++)
+        {
+            ViewportLine line = lines[index];
+            int visibleRow = contentStartRow + (index - firstLine);
+            if (line.View is not null)
+            {
+                line.View.VisibleStartRow = line.View.VisibleStartRow > 0
+                    ? Math.Min(line.View.VisibleStartRow, visibleRow)
+                    : visibleRow;
+                line.View.VisibleEndRow = visibleRow;
+            }
+
+            Console.Write(line.Text);
+            Console.Write("\r\n");
+        }
+
+        string scrollHint = maximumConversationScrollOffset == 0
+            ? "Tool Call / Result はクリックで個別に展開・折りたたみできます。"
+            : $"↑/↓ または PageUp/PageDown でスクロール · {conversationScrollOffset}/{maximumConversationScrollOffset} · クリックでTool Callを開閉";
+        AnsiConsole.MarkupLine($"[grey]{Markup.Escape(scrollHint)}[/]");
+    }
+
+    private void RenderCompactHeader()
+    {
+        ProviderProfile? profile = providerRegistry.Resolve();
+        string provider = profile?.Name ?? settings.ProviderName;
+        AnsiConsole.MarkupLine(
+            $"[deepskyblue1][bold]AEGIS[/][/] [grey]Turn {turnNumber} · {Markup.Escape(provider)} · {Markup.Escape(settings.Model)}[/]");
+    }
+
+    private IReadOnlyList<ViewportLine> BuildConversationLines()
+    {
+        List<ViewportLine> lines = [];
+
+        // Keep the transcript in chronological order. The current turn's
+        // assistant message is rendered below its Tool Calls so it is not
+        // duplicated when it is already present in the persisted history.
+        IEnumerable<ChatEntry> transcript = history;
+        if (lastAnswer is not null &&
+            history.LastOrDefault()?.Role.Equals("assistant", StringComparison.OrdinalIgnoreCase) == true &&
+            string.Equals(history[^1].Text, lastAnswer, StringComparison.Ordinal))
+        {
+            transcript = history.Take(history.Count - 1);
+        }
+
+        foreach (ChatEntry entry in transcript)
+        {
+            string title = entry.Role.Equals("user", StringComparison.OrdinalIgnoreCase)
+                ? "User"
+                : "Assistant";
+            AddViewportBox(lines, title, entry.Text, view: null);
+        }
+
+        foreach (ToolCallView view in toolCallViews)
+        {
+            string callBody = IsToolCallExpanded(view)
+                ? $"Tool: {view.Name}\nCall ID: {view.CallId}\n\nArguments:\n{view.Arguments}"
+                : $"▶ {view.Name}\nCall ID: {view.CallId}\n引数: 折りたたみ中（クリックで展開）";
+            AddViewportBox(lines, $"Tool Call · {view.Name}", callBody, view);
+
+            if (view.HasResult)
+            {
+                string status = view.Succeeded ? "完了" : "失敗";
+                string resultBody = IsToolCallExpanded(view)
+                    ? $"Tool: {view.Name}\nCall ID: {view.CallId}\n状態: {status}\n\n{view.Result ?? "(結果なし)"}"
+                    : $"{(view.Succeeded ? "✓" : "✗")} {view.Name}\nCall ID: {view.CallId}\n結果: {status}（クリックで展開）";
+                AddViewportBox(lines, $"Tool Result · {view.Name}", resultBody, view);
+            }
+        }
+
+        if (lastAnswer is not null)
+        {
+            AddViewportBox(
+                lines,
+                "回答",
+                string.IsNullOrWhiteSpace(lastAnswer) ? "(テキスト応答なし)" : lastAnswer,
+                view: null);
+        }
+
+        if (lines.Count == 0)
+        {
+            lines.Add(new ViewportLine("(会話はまだありません)", null));
+        }
+
+        return lines;
+    }
+
+    private static void AddViewportBox(
+        ICollection<ViewportLine> destination,
+        string title,
+        string body,
+        ToolCallView? view)
+    {
+        // Leave one column empty so the terminal does not auto-wrap the right
+        // border onto an extra row and invalidate mouse hit testing.
+        int width = Math.Max(20, Math.Min(Math.Max(20, GetConsoleWidth() - 1), 120));
+        int contentWidth = width - 4;
+        string safeTitle = ClipViewportText($" {title} ", width - 3);
+        destination.Add(new ViewportLine(
+            $"┌─{safeTitle}{new string('─', Math.Max(0, width - 3 - safeTitle.Length))}┐",
+            view));
+
+        foreach (string rawLine in WrapViewportText(body, contentWidth))
+        {
+            string content = ClipViewportText(rawLine, contentWidth);
+            destination.Add(new ViewportLine(
+                $"│ {content.PadRight(contentWidth)} │",
+                view));
+        }
+
+        destination.Add(new ViewportLine($"└{new string('─', width - 2)}┘", view));
+    }
+
+    private static IReadOnlyList<string> WrapViewportText(string text, int width)
+    {
+        List<string> lines = [];
+        string normalized = text.Replace('\r', ' ').Replace('\t', ' ');
+        foreach (string rawLine in normalized.Split('\n'))
+        {
+            if (rawLine.Length == 0)
+            {
+                lines.Add(string.Empty);
+                continue;
+            }
+
+            for (int offset = 0; offset < rawLine.Length; offset += width)
+            {
+                lines.Add(rawLine.Substring(offset, Math.Min(width, rawLine.Length - offset)));
+            }
+        }
+
+        return lines;
+    }
+
+    private static string ClipViewportText(string value, int maximumLength)
+    {
+        return value.Length <= maximumLength ? value : value[..maximumLength];
+    }
+
+    private static int GetConsoleWidth()
+    {
+        try
+        {
+            return Math.Max(20, Console.WindowWidth);
+        }
+        catch (IOException)
+        {
+            return 80;
+        }
+    }
+
+    private static int GetConsoleHeight()
+    {
+        try
+        {
+            return Math.Max(8, Console.WindowHeight);
+        }
+        catch (IOException)
+        {
+            return 24;
         }
     }
 
@@ -979,6 +1220,7 @@ internal sealed class AegisTui
 
         const string prompt = "aegis> ";
         StringBuilder buffer = new();
+        StringBuilder? pendingEscapeSequence = null;
         int selectedSuggestion = -1;
         int renderedSuggestionLines = 0;
         bool previousTreatControlCAsInput = Console.TreatControlCAsInput;
@@ -1002,21 +1244,67 @@ internal sealed class AegisTui
                     renderedSuggestionLines);
                 ConsoleKeyInfo key = Console.ReadKey(intercept: true);
 
-                if (key.Key == ConsoleKey.Escape &&
-                    TryReadMouseClick(out int mouseRow))
+                if (pendingEscapeSequence is not null)
                 {
-                    if (ToggleToolCallAtRow(
-                        mouseRow,
-                        prompt,
-                        buffer.ToString(),
-                        suggestions,
-                        selectedSuggestion,
-                        ref renderedSuggestionLines))
+                    EscapeSequenceState sequenceState = ConsumeEscapeSequence(
+                        pendingEscapeSequence,
+                        key,
+                        out EscapeAction escapeAction);
+                    if (sequenceState == EscapeSequenceState.Pending)
                     {
                         continue;
                     }
 
-                    // Mouse clicks outside a Tool Call are intentionally ignored.
+                    pendingEscapeSequence = null;
+                    if (sequenceState == EscapeSequenceState.Complete)
+                    {
+                        if (escapeAction.MouseEvent.HasValue)
+                        {
+                            MouseEvent mouseEvent = escapeAction.MouseEvent.Value;
+                            if (mouseEvent.IsWheel)
+                            {
+                                ScrollConversation(
+                                    mouseEvent.WheelDirection > 0 ? 3 : -3,
+                                    prompt,
+                                    buffer.ToString(),
+                                    suggestions,
+                                    selectedSuggestion,
+                                    ref renderedSuggestionLines);
+                            }
+                            else if (mouseEvent.IsLeftClick)
+                            {
+                                ToggleToolCallAtRow(
+                                    mouseEvent.Row,
+                                    prompt,
+                                    buffer.ToString(),
+                                    suggestions,
+                                    selectedSuggestion,
+                                    ref renderedSuggestionLines);
+                            }
+                        }
+                        else
+                        {
+                            HandleEscapeAction(
+                                escapeAction.Kind,
+                                prompt,
+                                buffer.ToString(),
+                                suggestions,
+                                ref selectedSuggestion,
+                                ref renderedSuggestionLines);
+                        }
+
+                        continue;
+                    }
+
+                    // An unrecognized escape sequence behaves like Escape.
+                    buffer.Clear();
+                    selectedSuggestion = -1;
+                    continue;
+                }
+
+                if (key.Key == ConsoleKey.Escape || key.KeyChar == '\u001b')
+                {
+                    pendingEscapeSequence = new StringBuilder();
                     continue;
                 }
 
@@ -1025,14 +1313,50 @@ internal sealed class AegisTui
                     throw new OperationCanceledException();
                 }
 
-                if (key.Key == ConsoleKey.Enter)
+                if (key.Key == ConsoleKey.Enter || key.KeyChar is '\r' or '\n')
                 {
-                    RenderInputLine(prompt, buffer.ToString(), [], -1, renderedSuggestionLines);
+                    string submittedInput = buffer.ToString();
+                    if (selectedSuggestion >= 0 && selectedSuggestion < suggestions.Count)
+                    {
+                        string selectedCommand = suggestions[selectedSuggestion];
+                        if (selectedCommand.EndsWith(' '))
+                        {
+                            buffer.Clear();
+                            buffer.Append(selectedCommand);
+                            selectedSuggestion = -1;
+                            continue;
+                        }
+
+                        submittedInput = selectedCommand;
+                    }
+
+                    RenderInputLine(prompt, submittedInput, [], -1, renderedSuggestionLines);
                     Console.WriteLine();
-                    return buffer.ToString();
+                    return submittedInput;
                 }
 
-                if (key.Key == ConsoleKey.Backspace)
+                if (key.Key is ConsoleKey.PageUp or ConsoleKey.PageDown or ConsoleKey.Home or ConsoleKey.End)
+                {
+                    int page = Math.Max(1, GetConsoleHeight() / 2);
+                    int delta = key.Key switch
+                    {
+                        ConsoleKey.PageUp => page,
+                        ConsoleKey.PageDown => -page,
+                        ConsoleKey.Home => int.MaxValue,
+                        ConsoleKey.End => int.MinValue,
+                        _ => 0,
+                    };
+                    ScrollConversation(
+                        delta,
+                        prompt,
+                        buffer.ToString(),
+                        suggestions,
+                        selectedSuggestion,
+                        ref renderedSuggestionLines);
+                    continue;
+                }
+
+                if (key.Key == ConsoleKey.Backspace || key.KeyChar is '\b' or '\u007f')
                 {
                     if (buffer.Length > 0)
                     {
@@ -1055,6 +1379,19 @@ internal sealed class AegisTui
                     continue;
                 }
 
+                if (suggestions.Count == 0 &&
+                    key.Key is (ConsoleKey.UpArrow or ConsoleKey.DownArrow))
+                {
+                    ScrollConversation(
+                        key.Key == ConsoleKey.UpArrow ? 3 : -3,
+                        prompt,
+                        buffer.ToString(),
+                        suggestions,
+                        selectedSuggestion,
+                        ref renderedSuggestionLines);
+                    continue;
+                }
+
                 if (key.Key == ConsoleKey.Tab && suggestions.Count > 0)
                 {
                     buffer.Clear();
@@ -1063,7 +1400,7 @@ internal sealed class AegisTui
                     continue;
                 }
 
-                if (key.Key == ConsoleKey.Escape)
+                if (key.Key == ConsoleKey.Escape || key.KeyChar == '\u001b')
                 {
                     buffer.Clear();
                     selectedSuggestion = -1;
@@ -1083,6 +1420,90 @@ internal sealed class AegisTui
         }
     }
 
+    private void HandleEscapeAction(
+        EscapeActionKind action,
+        string prompt,
+        string input,
+        IReadOnlyList<string> suggestions,
+        ref int selectedSuggestion,
+        ref int renderedSuggestionLines)
+    {
+        if (action is EscapeActionKind.SuggestionUp or EscapeActionKind.SuggestionDown)
+        {
+            if (suggestions.Count > 0)
+            {
+                selectedSuggestion = action == EscapeActionKind.SuggestionUp
+                    ? selectedSuggestion <= 0 ? suggestions.Count - 1 : selectedSuggestion - 1
+                    : selectedSuggestion >= suggestions.Count - 1 ? 0 : selectedSuggestion + 1;
+                return;
+            }
+
+            ScrollConversation(
+                action == EscapeActionKind.SuggestionUp ? 3 : -3,
+                prompt,
+                input,
+                suggestions,
+                selectedSuggestion,
+                ref renderedSuggestionLines);
+            return;
+        }
+
+        int delta = action switch
+        {
+            EscapeActionKind.PageUp => Math.Max(1, GetConsoleHeight() / 2),
+            EscapeActionKind.PageDown => -Math.Max(1, GetConsoleHeight() / 2),
+            EscapeActionKind.Home => int.MaxValue,
+            EscapeActionKind.End => int.MinValue,
+            _ => 0,
+        };
+        ScrollConversation(
+            delta,
+            prompt,
+            input,
+            suggestions,
+            selectedSuggestion,
+            ref renderedSuggestionLines);
+    }
+
+    private static EscapeSequenceState ConsumeEscapeSequence(
+        StringBuilder sequence,
+        ConsoleKeyInfo key,
+        out EscapeAction action)
+    {
+        action = default;
+        if (key.KeyChar == '\0' || key.KeyChar == '\u001b')
+        {
+            return EscapeSequenceState.Invalid;
+        }
+
+        sequence.Append(key.KeyChar);
+        string value = sequence.ToString();
+        action = value switch
+        {
+            "[A" => new EscapeAction(EscapeActionKind.SuggestionUp, null),
+            "[B" => new EscapeAction(EscapeActionKind.SuggestionDown, null),
+            "[5~" => new EscapeAction(EscapeActionKind.PageUp, null),
+            "[6~" => new EscapeAction(EscapeActionKind.PageDown, null),
+            "[H" => new EscapeAction(EscapeActionKind.Home, null),
+            "[F" => new EscapeAction(EscapeActionKind.End, null),
+            _ => default,
+        };
+        if (action.Kind != EscapeActionKind.None)
+        {
+            return EscapeSequenceState.Complete;
+        }
+
+        if (TryParseMouseEventText(value, out MouseEvent mouseEvent))
+        {
+            action = new EscapeAction(EscapeActionKind.Mouse, mouseEvent);
+            return EscapeSequenceState.Complete;
+        }
+
+        return value.StartsWith("[", StringComparison.Ordinal) && value.Length <= 32
+            ? EscapeSequenceState.Pending
+            : EscapeSequenceState.Invalid;
+    }
+
     private bool ToggleToolCallAtRow(
         int mouseRow,
         string prompt,
@@ -1091,21 +1512,14 @@ internal sealed class AegisTui
         int selectedSuggestion,
         ref int renderedSuggestionLines)
     {
-        ToolCallView? view = toolCallViews.FirstOrDefault(item => item.ContainsRow(mouseRow));
+        ToolCallView? view = toolCallViews.FirstOrDefault(item => item.ContainsVisibleRow(mouseRow));
         if (view is null)
         {
             return false;
         }
 
         view.ExpandedOverride = !IsToolCallExpanded(view);
-        TryClear();
-        RenderWelcome();
-        RenderDashboard();
-        RenderToolCallViews();
-        if (lastAnswer is not null)
-        {
-            RenderPanel("回答", string.IsNullOrWhiteSpace(lastAnswer) ? "(テキスト応答なし)" : lastAnswer, Color.Green);
-        }
+        RenderConversationViewport();
 
         renderedSuggestionLines = RenderInputLine(
             prompt,
@@ -1116,29 +1530,61 @@ internal sealed class AegisTui
         return true;
     }
 
-    private static bool TryReadMouseClick(out int row)
+    private void ScrollConversation(
+        int delta,
+        string prompt,
+        string input,
+        IReadOnlyList<string> suggestions,
+        int selectedSuggestion,
+        ref int renderedSuggestionLines)
     {
-        row = 0;
-        if (!WaitForInputKey())
+        int nextOffset = delta == int.MaxValue
+            ? maximumConversationScrollOffset
+            : delta == int.MinValue
+                ? 0
+                : Math.Clamp(
+                    conversationScrollOffset + delta,
+                    0,
+                    maximumConversationScrollOffset);
+        if (nextOffset == conversationScrollOffset)
+        {
+            return;
+        }
+
+        conversationScrollOffset = nextOffset;
+        RenderConversationViewport();
+        renderedSuggestionLines = RenderInputLine(
+            prompt,
+            input,
+            suggestions,
+            selectedSuggestion,
+            previousSuggestionLines: 0);
+    }
+
+    private static bool TryReadMouseEvent(out MouseEvent mouseEvent)
+    {
+        mouseEvent = default;
+        const int mouseSequenceTimeoutMilliseconds = 1000;
+        if (!WaitForInputKey(mouseSequenceTimeoutMilliseconds))
         {
             return false;
         }
 
         ConsoleKeyInfo openingBracket = Console.ReadKey(intercept: true);
-        if (openingBracket.KeyChar != '[' || !WaitForInputKey())
+        if (openingBracket.KeyChar != '[' || !WaitForInputKey(mouseSequenceTimeoutMilliseconds))
         {
             return false;
         }
 
         ConsoleKeyInfo sgrMarker = Console.ReadKey(intercept: true);
-        if (sgrMarker.KeyChar != '<')
+        if (sgrMarker.KeyChar != '<' || !WaitForInputKey(mouseSequenceTimeoutMilliseconds))
         {
             return false;
         }
 
         StringBuilder payload = new();
         char terminator = '\0';
-        while (WaitForInputKey(25))
+        while (WaitForInputKey(mouseSequenceTimeoutMilliseconds))
         {
             char value = Console.ReadKey(intercept: true).KeyChar;
             if (value is 'M' or 'm')
@@ -1160,10 +1606,53 @@ internal sealed class AegisTui
         }
 
         string[] parts = payload.ToString().Split(';');
-        return parts.Length == 3 &&
-            int.TryParse(parts[0], out int button) &&
-            int.TryParse(parts[2], out row) &&
-            (button & 3) == 0;
+        if (parts.Length != 3 ||
+            !int.TryParse(parts[0], out int button) ||
+            !int.TryParse(parts[1], out int column) ||
+            !int.TryParse(parts[2], out int row))
+        {
+            return false;
+        }
+
+        mouseEvent = new MouseEvent(
+            button,
+            column,
+            row,
+            terminator == 'M',
+            (button & 64) != 0
+                ? (button & 1) == 0 ? 1 : -1
+                : 0);
+        return true;
+    }
+
+    private static bool TryParseMouseEventText(string value, out MouseEvent mouseEvent)
+    {
+        mouseEvent = default;
+        if (!value.StartsWith("[<", StringComparison.Ordinal) ||
+            value.Length < 8 ||
+            value[^1] is not ('M' or 'm'))
+        {
+            return false;
+        }
+
+        string[] parts = value[2..^1].Split(';');
+        if (parts.Length != 3 ||
+            !int.TryParse(parts[0], out int button) ||
+            !int.TryParse(parts[1], out int column) ||
+            !int.TryParse(parts[2], out int row))
+        {
+            return false;
+        }
+
+        mouseEvent = new MouseEvent(
+            button,
+            column,
+            row,
+            value[^1] == 'M',
+            (button & 64) != 0
+                ? (button & 1) == 0 ? 1 : -1
+                : 0);
+        return true;
     }
 
     private static bool WaitForInputKey(int timeoutMilliseconds = 25)
@@ -1262,7 +1751,9 @@ internal sealed class AegisTui
     {
         try
         {
-            return Console.GetCursorPosition().Top + 1;
+            // SGR mouse coordinates are relative to the visible window, while
+            // Console.CursorTop is relative to the whole screen buffer.
+            return Console.GetCursorPosition().Top - Console.WindowTop + 1;
         }
         catch (IOException)
         {
@@ -1285,17 +1776,65 @@ internal sealed class AegisTui
             return false;
         }
 
-        // SGR mouse mode reports click coordinates as ESC[<button;column;rowM.
-        Console.Write("\u001b[?1000h\u001b[?1006h");
+        EnableVirtualTerminalInput();
+
+        // SGR mouse mode reports click and wheel coordinates as
+        // ESC[<button;column;rowM. 1002 improves wheel support in terminals
+        // that only emit wheel events in button-event tracking mode.
+        Console.Write("\u001b[?1000h\u001b[?1002h\u001b[?1006h");
         Console.Out.Flush();
         return true;
     }
 
     private static void DisableMouseReporting()
     {
-        Console.Write("\u001b[?1006l\u001b[?1000l");
+        Console.Write("\u001b[?1006l\u001b[?1002l\u001b[?1000l");
         Console.Out.Flush();
+
+        if (originalConsoleInputMode.HasValue && OperatingSystem.IsWindows())
+        {
+            IntPtr inputHandle = GetStdHandle(StandardInputHandle);
+            SetConsoleMode(inputHandle, originalConsoleInputMode.Value);
+            originalConsoleInputMode = null;
+        }
     }
+
+    private static void EnableVirtualTerminalInput()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        IntPtr inputHandle = GetStdHandle(StandardInputHandle);
+        if (inputHandle == IntPtr.Zero ||
+            !GetConsoleMode(inputHandle, out uint inputMode))
+        {
+            return;
+        }
+
+        const uint enableVirtualTerminalInput = 0x0200;
+        if ((inputMode & enableVirtualTerminalInput) != 0)
+        {
+            return;
+        }
+
+        if (SetConsoleMode(inputHandle, inputMode | enableVirtualTerminalInput))
+        {
+            originalConsoleInputMode = inputMode;
+        }
+    }
+
+    private const int StandardInputHandle = -10;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int standardHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetConsoleMode(IntPtr consoleHandle, out uint mode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleMode(IntPtr consoleHandle, uint mode);
 
     private void RenderWelcome()
     {
@@ -1373,6 +1912,8 @@ internal sealed class AegisTui
             "/toolcalls            Tool Call 表示状態\n" +
             "/toolcalls collapse   Tool Call / Result を折りたたむ\n" +
             "/toolcalls expand     Tool Call / Result を詳細表示\n" +
+            "Mouse wheel / ↑↓     会話履歴をスクロール\n" +
+            "PageUp/PageDown      会話履歴をページ移動\n" +
             "/tools                利用可能な Tool と説明\n" +
             "/provider list        登録済みプロバイダー\n" +
             "/provider add         プロバイダー登録ウィザード\n" +
@@ -1414,9 +1955,14 @@ internal sealed class AegisTui
             .AddColumn("説明");
         foreach (AITool tool in mafService.Tools)
         {
+            string description = string.IsNullOrWhiteSpace(tool.Description)
+                ? tool is HostedWebSearchTool
+                    ? "モデル側の hosted Web Search を使ってインターネットを検索します。"
+                    : "(説明なし)"
+                : tool.Description;
             table.AddRow(
                 Markup.Escape(tool.Name),
-                Markup.Escape(string.IsNullOrWhiteSpace(tool.Description) ? "(説明なし)" : tool.Description));
+                Markup.Escape(description));
         }
 
         AnsiConsole.Write(table);
@@ -1449,6 +1995,41 @@ internal sealed class AegisTui
             .ToArray();
     }
 
+    private sealed record ViewportLine(string Text, ToolCallView? View);
+
+    private enum EscapeSequenceState
+    {
+        Pending,
+        Complete,
+        Invalid,
+    }
+
+    private enum EscapeActionKind
+    {
+        None,
+        SuggestionUp,
+        SuggestionDown,
+        PageUp,
+        PageDown,
+        Home,
+        End,
+        Mouse,
+    }
+
+    private readonly record struct EscapeAction(EscapeActionKind Kind, MouseEvent? MouseEvent);
+
+    private readonly record struct MouseEvent(
+        int Button,
+        int Column,
+        int Row,
+        bool IsPress,
+        int WheelDirection)
+    {
+        public bool IsWheel => WheelDirection != 0;
+
+        public bool IsLeftClick => IsPress && !IsWheel && (Button & 3) == 0;
+    }
+
     private sealed class ToolCallView(string callId, string name)
     {
         public string CallId { get; } = callId;
@@ -1473,8 +2054,12 @@ internal sealed class AegisTui
 
         public int ResultEndRow { get; set; } = -1;
 
-        public bool ContainsRow(int row) =>
-            IsWithin(row, CallStartRow, CallEndRow) || IsWithin(row, ResultStartRow, ResultEndRow);
+        public int VisibleStartRow { get; set; } = -1;
+
+        public int VisibleEndRow { get; set; } = -1;
+
+        public bool ContainsVisibleRow(int row) =>
+            IsWithin(row, VisibleStartRow, VisibleEndRow);
 
         private static bool IsWithin(int row, int start, int end) =>
             start > 0 && end >= start && row >= start && row <= end;

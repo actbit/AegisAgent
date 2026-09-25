@@ -69,18 +69,19 @@ public sealed class MafCodingAgentService
         CodingWorkspace workspace,
         IChatClient chatClient)
     {
-        AITool[] tools = workspace.CreateTools();
+        AITool[] workspaceTools = workspace.CreateTools();
+        AITool[] tools = [..workspaceTools, new HostedWebSearchTool()];
         HarnessAgentOptions harnessOptions = new()
         {
             Name = "Aegis Coding Agent",
             HarnessInstructions = "Act as a careful, repository-aware coding agent. Work in small, verifiable steps.",
-            DisableWebSearch = true,
+            DisableWebSearch = false,
             DisableFileMemory = true,
             MaximumIterationsPerRequest = settings.MaxToolIterations,
             ChatOptions = new ChatOptions
             {
                 Instructions = AgentInstructions(workspace.RootPath),
-                Tools = tools,
+                Tools = workspaceTools,
                 // The ChatGPT Codex endpoint rejects max_output_tokens. OpenCode
                 // omits it for this backend as well.
                 MaxOutputTokens = settings.BackendKind.Equals("maf-chatgpt-oauth", StringComparison.OrdinalIgnoreCase)
@@ -229,6 +230,7 @@ Workspace and safety rules:
 - Do not place API keys or other secrets in source files.
 - Ask the user when requirements are ambiguous or a destructive action is genuinely required.
 - Use `run_command` for focused, repository-local verification; keep commands short and explain why you need them.
+- For current external information, use the hosted `WebSearch` tool when it is available and include the useful source URLs in the answer.
 
 The user may ask in Japanese or English. Match the user's language.
 """;

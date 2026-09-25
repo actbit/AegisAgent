@@ -17,6 +17,9 @@ AegisAgent.Core/     MAF実行、workspaceツール、プロバイダー、OAuth
 - Spectre.Console のダッシュボード、履歴、パネル、確認プロンプト
 - 実行中の Tool Call / Tool Result のリアルタイム表示、クリックによる個別の展開・折りたたみ、`/tools` 一覧
 - workspace 内に限定したファイル一覧、読み込み、検索、編集、git status、コマンド実行
+- 検索 Tool は `FindFiles`（ファイル名・パス glob）、`SearchText`（文字列検索）、`SearchCode`（正規表現検索）を提供
+- Microsoft Agent Framework の hosted `WebSearch` Tool によるインターネット検索
+- `WebFetch` による HTTP/HTTPS ページ本文の取得と HTML テキスト抽出
 - 編集とコマンド実行の承認ゲート（`--auto-approve` で省略可能）
 - TUI からのプロバイダー登録・切替・削除
 - OpenAI API、DeepSeek、Anthropic Claude、OpenRouter
